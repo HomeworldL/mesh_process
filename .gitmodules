@@ -1,0 +1,6 @@
+[submodule "third_party/CoACD"]
+	path = third_party/CoACD
+	url = https://github.com/SarahWeiii/CoACD.git
+[submodule "third_party/ACVD"]
+	path = third_party/ACVD
+	url = https://github.com/valette/ACVD.git
