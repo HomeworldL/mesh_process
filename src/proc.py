@@ -550,8 +550,6 @@ def process_all(src_root, dst_root, args):
                 quiet=args.acvd_quiet,
             )
 
-        break
-
     print("Done processing all objects.")
 
 
