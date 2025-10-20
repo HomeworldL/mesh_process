@@ -12,6 +12,7 @@ Some related works:
 * [object2urdf](https://github.com/harvard-microrobotics/object2urdf)
 * [YCB_sim](https://github.com/vikashplus/YCB_sim)
 * [MJCF-Component](https://github.com/AvalonGuo/MJCF-Component)
+* [DexGraspNet-asset_process](https://github.com/PKU-EPIC/DexGraspNet/tree/main/asset_process)
 
 ### Features
 * The object coordinate system coincides with the principal inertial system.
