@@ -6,7 +6,6 @@ Modified to use processed obj files.
 Added mass, inertia to the urdf and mujoco xml files.
 """
 
-from scipy.spatial.transform import Rotation
 import numpy as np
 import os
 import copy
