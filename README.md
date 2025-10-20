@@ -49,6 +49,15 @@ Build the third-party package following their [installation guide](https://githu
 
 ### Run
 
+Downloading YCB objects
+
+``` bash
+python src/download_ycb_dataset.py
+python src/clean_ycb_dataset.py
+```
+
+Preprocess
+
 ``` bash
 # from repository root
 python src/proc.py \
