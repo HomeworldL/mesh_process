@@ -47,6 +47,15 @@ pip install trimesh
 
 Build the third-party package following their [installation guide](https://github.com/JYChen18/MeshProcess)
 
+Note:
+
+Modified CoACD main.cpp to save manifold .obj with original size (denormalize)
+
+``` bash 181
+  Model tmp = m;
+  tmp.Recover(bbox);
+  tmp.SaveOBJ(params.remesh_output_name);
+```
 
 ### Run
 
