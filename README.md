@@ -1,88 +1,253 @@
 # mesh_process
 
 ## Introduction
-A small toolkit to preprocess YCB-style textured OBJ models and generate URDF / MuJoCo XML (MJCF) from the processed outputs, where the object coordinate system is the primary inertial frame.
 
-Modified from:
-* [MeshProcess](https://github.com/JYChen18/MeshProcess)
-* [YCB_Dataset](https://github.com/elpis-lab/YCB_Dataset)
+Toolkit for preparing object meshes for grasping/simulation pipelines. It supports:
 
-Some related works:
-* [obj2mjcf](https://github.com/kevinzakka/obj2mjcf)
-* [object2urdf](https://github.com/harvard-microrobotics/object2urdf)
-* [YCB_sim](https://github.com/vikashplus/YCB_sim)
-* [MJCF-Component](https://github.com/AvalonGuo/MJCF-Component)
-* [DexGraspNet-asset_process](https://github.com/PKU-EPIC/DexGraspNet/tree/main/asset_process)
+- mesh alignment to COM + principal inertia axes,
+- watertight mesh generation (CoACD remesh output),
+- convex decomposition for collision meshes,
+- mesh simplification (ACVD),
+- URDF and MuJoCo XML (MJCF) export with inertial parameters.
 
-### Features
-* The object coordinate system coincides with the principal inertial system.
+## Unified Data Layout
 
-* Batch pipeline: copy raw .obj/.mtl/texture → transform to COM & principal axes → watertight (CoACD) → convex parts (CoACD) → simplify (ACVD).
+All datasets use the same layout:
 
-* Export URDF and MuJoCo XML using inertia.obj (visual) and convex parts (collision).
-
-* Metadata (mass, COM, principal moments/axes) saved per object.
-
-### Quick layout
-
-``` bash
-assets/YCB/ycb_datasets/
-└── 002_master_chef_can/
-    ├── raw/               # source textured.obj, textured.mtl, textures...
-    ├── inertia.obj        # mesh in COM + principal-axes frame
-    ├── manifold.obj       # watertight output from CoACD
-    ├── coacd.obj          # coacd main output
-    ├── meshes/            # convex pieces (coacd_convex_piece_*.obj)
-    ├── simplified.obj     # ACVD simplified mesh
-    └── metadata.json
+```bash
+assets/objects/
+├── raw/
+│   ├── YCB/...
+│   ├── RealDex/...
+│   ├── GraspNet/...
+│   ├── Objaverse/...
+│   └── ShapeNet*/...
+└── processed/
+    ├── <dataset>/<object_id>/raw.obj (+ optional textures)
+    └── <dataset>/manifest.json
 ```
 
-## Getting Started
+## Dependencies
 
-### Dependencies
-
-``` bash
-pip install trimesh
+```bash
+pip install trimesh objaverse gdown tqdm pymeshlab pillow
+# optional: MuJoCo viewer script
+pip install mujoco
 ```
 
-Build the third-party package following their [installation guide](https://github.com/JYChen18/MeshProcess)
+Build third-party binaries first:
 
-Note:
+- `third_party/CoACD/build/main`
+- `third_party/ACVD/bin/ACVD`
 
-Modified CoACD main.cpp to save manifold .obj with original size (denormalize)
+## Quick Visualization
 
-``` bash 181
-  Model tmp = m;
-  tmp.Recover(bbox);
-  tmp.SaveOBJ(params.remesh_output_name);
+Randomly preview one OBJ from a processed dataset:
+
+```bash
+python src/visualize_obj.py --dataset YCB
 ```
 
-### Run
+Optional:
 
-Downloading YCB objects
-
-``` bash
-python src/download_ycb_dataset.py
-python src/clean_ycb_dataset.py
+```bash
+python src/visualize_obj.py --dataset RealDex --seed 42
+python src/visualize_obj.py --dataset YCB --mesh-type visual
 ```
 
-Preprocess
+Notes:
+- `--mesh-type raw|visual` chooses `raw.obj` or `visual.obj`.
+- If `--object-id` is provided, it visualizes exactly that object folder.
 
-``` bash
-# from repository root
-python src/proc.py \
-  --src assets/YCB/ycb \
-  --dst assets/YCB/ycb_datasets \
-  --acvd-vertnum 2000 \
-  --acvd-gradation 1.5
+MuJoCo MJCF visualization:
+
+```bash
+python src/visualize_obj_mujcoco.py --dataset YCB
+python src/visualize_obj_mujcoco.py --dataset YCB --object-id YCB_001_chips_can
 ```
 
-* --skip-existing — skip outputs that already exist
+## Stage 1: Ingest (Download/Organize/Verify)
 
-* --force — overwrite outputs
+Use a single source-ingest entrypoint (`src/ingest_assets.py`), parallel to `process_meshes.py` and `build_object_descriptions.py`.
 
-* --preview — show trimesh preview for the inertia-transformed mesh (requires GUI)
+Currently completed and used adapters:
+- `GraspNet`, `HOPE`, `KIT`, `MSO`, `Objaverse`, `RealDex`, `YCB`, `DexNet`
 
-* --coacd-quiet / --acvd-quiet — suppress external tool stdout
+```bash
+# YCB example
+python src/ingest_assets.py download --source YCB
+python src/ingest_assets.py organize --source YCB
+python src/ingest_assets.py verify --source YCB --check-paths
 
-* --mass <json> — optional JSON map of object masses for inertia computation
+# RealDex / GraspNet object archives (Google Drive)
+python src/ingest_assets.py download --source RealDex
+python src/ingest_assets.py organize --source RealDex
+
+python src/ingest_assets.py download --source GraspNet
+python src/ingest_assets.py organize --source GraspNet
+
+# HOPE object folder (Google Drive)
+python src/ingest_assets.py download --source HOPE
+python src/ingest_assets.py organize --source HOPE
+
+# KIT / DexNet
+python src/ingest_assets.py download --source KIT
+python src/ingest_assets.py organize --source KIT
+python src/ingest_assets.py download --source DexNet
+python src/ingest_assets.py organize --source DexNet
+
+# Objaverse (use --subset to filter categories from category_annotation.json)
+python src/ingest_assets.py download --source Objaverse --subset Daily-Used
+python src/ingest_assets.py organize --source Objaverse
+# For evaluation subsets: deterministic random sample of N objects
+python src/ingest_assets.py organize --source Objaverse --sample-n 500
+python src/ingest_assets.py organize --source Objaverse --sample-n 500 --sample-seed 0
+
+# ShapeNet (license/login protected):
+# 1) manual download, then place archive under assets/objects/raw/<dataset>/
+#    or set env var SHAPENET_CORE_ARCHIVE / SHAPENET_SEM_ARCHIVE
+python src/ingest_assets.py download --source ShapeNetCore
+python src/ingest_assets.py organize --source ShapeNetCore
+python src/ingest_assets.py download --source ShapeNetSem
+python src/ingest_assets.py organize --source ShapeNetSem
+```
+
+Notes:
+- Google Drive downloads use `gdown` (`pip install gdown`).
+- Download stage uses `tqdm` progress bars (YCB stream download, archive extract, Objaverse batch mirror).
+- `organize` will build `assets/objects/processed/<dataset>/manifest.json` automatically.
+- `mass_kg` is included per object; when unknown, default value is `0.1`.
+- Canonical organized file names are: `raw.obj`, optional `texture_map.png`, optional `textured.mtl`.
+- ShapeNetCore / ShapeNetSem usually require terms acceptance and authenticated/manual archive retrieval.
+
+## Dataset-Specific Structures
+
+### YCB
+
+- Download cache/extract: `assets/objects/raw/YCB/*`
+- Organized objects: `assets/objects/processed/YCB/YCB_<object_name>/raw.obj`
+- Keep `textured.mtl` and `texture_map.png` when present.
+
+### RealDex
+
+- Downloaded archive: `assets/objects/raw/RealDex/RealDex-objmodels.zip`
+- Extracted source: `assets/objects/raw/RealDex/RealDex-objmodels/models/*.obj`
+- Organized output: `assets/objects/processed/RealDex/RealDex_<object_name>/raw.obj`
+- RealDex object models are treated as OBJ-only (no texture assets).
+
+### GraspNet
+
+- Extracted source (current verified layout): `assets/objects/raw/GraspNet/models/models/<id>/`
+- Per object folder contains files such as `textured.obj`, `textured.mtl`, `texture_map.png`.
+- Organized output:
+  - `assets/objects/processed/GraspNet/GraspNet_<id>/raw.obj`
+  - keep only `textured.mtl` and `texture_map.png` next to `raw.obj`.
+
+### Objaverse
+
+- Mirrored downloads: `assets/objects/raw/Objaverse/objects/*.glb`
+- Organized objects: `assets/objects/processed/Objaverse/Objaverse_<name>/raw.obj`
+- Optional organize sampling: pass `--sample-n N` and optional `--sample-seed` (default `0`).
+- Raw mirror may use symlinks to cache files; this is expected.
+
+### HOPE
+
+- Downloaded source (official folder mirror): `assets/objects/raw/HOPE/hope_objects/`
+- Official layout per object: `<object_name>/google_16k/{textured.obj,textured.mtl,texture_map.png}`
+- Organized objects: `assets/objects/processed/HOPE/HOPE_<object_name>/raw.obj`
+- If textures exist, normalized outputs are `textured.mtl` + `texture_map.png`.
+
+### KIT
+
+- Download mode: crawl official list page and fetch each object's `meshes.zip` from `tmp.php` links.
+- Raw download/extract layout:
+  - `assets/objects/raw/KIT/archives/<id>_<object>.zip`
+  - `assets/objects/raw/KIT/objects/<object_name>/...`
+- Organized objects: `assets/objects/processed/KIT/KIT_<object_name>/raw.obj`
+- If textures exist, normalized outputs are `textured.mtl` + `texture_map.png`.
+
+### DexNet
+
+- Default `download` uses Google Drive file id `1dwzHMGI_bqekBoqpFgDRQSXsDIZj--v8`
+  (`https://drive.google.com/file/d/1dwzHMGI_bqekBoqpFgDRQSXsDIZj--v8/view`).
+- Optional override priority remains:
+  `DEXNET_SOURCE_DIR` > `DEXNET_ARCHIVE` > `DEXNET_URL` > default Google Drive source.
+- Organized objects: `assets/objects/processed/DexNet/DexNet_<object_name>/raw.obj`
+- If textures exist, normalized outputs are `textured.mtl` + `texture_map.png`.
+- Adapter is integrated in the same Stage-1 flow as other completed datasets.
+
+### ShapeNetCore / ShapeNetSem
+
+- Requires manual/authenticated archive acquisition.
+- Recommended flow: put archive under `assets/objects/raw/<dataset>/`, then run `download` + `organize`.
+- Organized output is normalized under `assets/objects/processed/<dataset>/`.
+
+## Stage 2: Process Meshes (`process_meshes.py`)
+
+Run Stage-2 on organized objects:
+
+```bash
+python src/process_meshes.py --dataset YCB --workers 8
+```
+
+Flow per object:
+- `mesh_transform` (always runs): regenerate `inertia.obj` and inertial principal data.
+- `mesh_manifold_and_convex_decomp`: generate `manifold.obj` + `coacd.obj`.
+- convex export: write `meshes/coacd_convex_piece_*.obj`.
+- `mesh_simplify`: generate `simplified.obj` (skip if exists unless `--force`).
+- `mesh_visual`: generate compressed visual assets (`visual.obj`, optional `visual.mtl`, optional `visual_texture_map.*`) with geometry decimation + OBJ text slimming + texture compression.
+
+Parallel and overwrite behavior:
+- Default is step-level skip where applicable.
+- `--force` recomputes all outputs.
+- `--workers` enables object-level parallel processing.
+- `--preview` requires `--workers 1`.
+
+Main output report:
+- `assets/objects/processed/<dataset>/manifest.process_meshes.json`
+- Per object fields include `process_status`, `process_error`, `center_of_mass`, `principal_moments`, `principal_axes`, and visual asset paths.
+
+## Stage 3: Build URDF / MJCF (`build_object_descriptions.py`)
+
+Build simulation descriptions from Stage-2 outputs:
+
+```bash
+python src/build_object_descriptions.py --dataset YCB --force
+```
+
+Data source:
+- `assets/objects/processed/<dataset>/manifest.process_meshes.json`
+- mass: `mass_kg`
+- inertia: `principal_moments`
+
+Mesh usage:
+- visual mesh: `visual.obj`
+- collision meshes: `meshes/coacd_convex_piece_*.obj`
+
+Outputs per object:
+- `<object_id>.urdf`
+- `<object_id>.xml`
+
+## Stage 4: Multi-view Point Cloud Sampling (`sample_pointcloud_views.py`)
+
+Sample partial point clouds from multiple camera viewpoints around each object:
+
+```bash
+python src/sample_pointcloud_views.py --dataset YCB --views 25 --points 4096
+```
+
+Input:
+- Stage-3 object MJCF: `<object_id>.xml`
+- Stage-2 process report: `manifest.process_meshes.json` (only `process_status=success` objects are sampled by default)
+
+Output per object:
+- `assets/objects/processed/<dataset>/<object_id>/vision_data/pc_views.npz`
+
+Default data layout in `pc_views.npz`:
+- `camera_intrinsic` (`fx, fy, cx, cy, width, height`)
+- `camera_extrinsic` (`[V, 4, 4]`)
+- `camera_position` (`[V, 3]`)
+- `camera_lookat` (`[V, 3]`)
+- `point_cloud` (`[V, N, 3]`)
+- `valid_point_num` (`[V]`)
+- `rgb_path` (reserved interface, currently empty)
