@@ -1,19 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# One-shot pipeline: Stage-1 ingest -> Stage-2 process -> Stage-3 descriptions
+# One-shot pipeline dedicated to Objaverse.
 # Usage:
-#   bash scripts/run_stage123.sh YCB
-#   bash scripts/run_stage123.sh Objaverse --subset Daily-Used --sample-n 500 --sample-seed 0 --workers 8
+#   bash scripts/run_stage_Objaverse.sh
+#   bash scripts/run_stage_Objaverse.sh --subset Daily-Used --sample-n 500 --sample-seed 0 --workers 8
 
-if [[ $# -lt 1 ]]; then
-  echo "Usage: $0 <DATASET> [--subset <name>] [--sample-n N] [--sample-seed S] [--workers N] [--force]"
-  exit 1
-fi
-
-DATASET="$1"
-shift
-
+DATASET="Objaverse"
 SUBSET=""
 SAMPLE_N=""
 SAMPLE_SEED="0"
@@ -49,8 +42,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-echo "[stage123] dataset=${DATASET}"
-echo "[stage123] ingest download"
+echo "[stage-objaverse] dataset=${DATASET}"
+echo "[stage-objaverse] ingest download"
 DOWNLOAD_CMD=(python src/ingest_assets.py download --source "${DATASET}")
 if [[ -n "${SUBSET}" ]]; then
   DOWNLOAD_CMD+=(--subset "${SUBSET}")
@@ -60,7 +53,7 @@ if [[ -n "${FORCE_FLAG}" ]]; then
 fi
 "${DOWNLOAD_CMD[@]}"
 
-echo "[stage123] ingest organize"
+echo "[stage-objaverse] ingest organize"
 ORGANIZE_CMD=(python src/ingest_assets.py organize --source "${DATASET}")
 if [[ -n "${SUBSET}" ]]; then
   ORGANIZE_CMD+=(--subset "${SUBSET}")
@@ -73,21 +66,21 @@ if [[ -n "${FORCE_FLAG}" ]]; then
 fi
 "${ORGANIZE_CMD[@]}"
 
-echo "[stage123] ingest verify"
+echo "[stage-objaverse] ingest verify"
 python src/ingest_assets.py verify --source "${DATASET}" --check-paths
 
-echo "[stage123] process meshes"
+echo "[stage-objaverse] process meshes"
 PROCESS_CMD=(python src/process_meshes.py --dataset "${DATASET}" --workers "${WORKERS}")
 if [[ -n "${FORCE_FLAG}" ]]; then
   PROCESS_CMD+=("${FORCE_FLAG}")
 fi
 "${PROCESS_CMD[@]}"
 
-echo "[stage123] build descriptions"
+echo "[stage-objaverse] build descriptions"
 BUILD_CMD=(python src/build_object_descriptions.py --dataset "${DATASET}")
 if [[ -n "${FORCE_FLAG}" ]]; then
   BUILD_CMD+=("${FORCE_FLAG}")
 fi
 "${BUILD_CMD[@]}"
 
-echo "[stage123] done"
+echo "[stage-objaverse] done"

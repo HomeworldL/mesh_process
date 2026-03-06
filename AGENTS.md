@@ -4,7 +4,7 @@
 
 - `src/`: main code.
   - `ingest_assets.py`: Stage-1 CLI (`download/organize/verify`) for object sources.
-  - `visualize_obj.py`: utility to preview one OBJ from `processed/<source>` (random by default, or specify object id, supports raw/visual).
+  - `visualize_obj.py`: utility to preview one OBJ from `processed/<source>` (random by default, or specify object id, supports raw/inertia/visual).
   - `visualize_obj_mujcoco.py`: utility to preview one built MJCF (`.xml`) in MuJoCo viewer.
   - `asset_ingest/`: source adapters and manifest schema.
     - `base.py`: abstract adapter interface.
@@ -25,6 +25,10 @@
   - `YCB`, `RealDex`, `GraspNet`, `HOPE`, `KIT`, `MSO`, `Objaverse`, `DexNet`.
 - Present but still evolving / not primary:
   - `ShapeNetCore`, `ShapeNetSem`.
+  - current ShapeNetCore/ShapeNetSem flow: selective extraction + per-object OBJ normalization (center-to-origin + max-extent-to-1.0) before organize output.
+  - abnormal-mesh drop thresholds in normalize step:
+    - pre `max_extent <= 1e-9` or pre aspect ratio (`max_extent/min_extent`) `> 1e5`
+    - post `max_extent` not in `[0.95, 1.05]` or post center norm `> 5e-3`
 
 ## Build, Test, and Development Commands
 
@@ -45,7 +49,7 @@
 - Stage-2 process: `python src/process_meshes.py --dataset YCB --workers 8`
 - Stage-3 export: `python src/build_object_descriptions.py --dataset YCB --force`
 - Quick mesh preview: `python src/visualize_obj.py --dataset YCB`
-
+  - mesh selection: `--mesh-type raw|inertia|visual`
 Build `third_party/CoACD` and `third_party/ACVD` binaries before running `process_meshes.py`.
 
 ## Stage-2 Process Flow (`process_meshes.py`)
@@ -53,10 +57,14 @@ Build `third_party/CoACD` and `third_party/ACVD` binaries before running `proces
 - Input: `assets/objects/processed/<dataset>/<object_id>/raw.obj`
 - Per-object steps:
   - `mesh_transform` (always run) -> `inertia.obj` + principal inertia info
+    - principal axes are assigned with signed/permuted matching so new XYZ remains as close as possible to original XYZ while still aligned to principal directions
   - `mesh_manifold_and_convex_decomp` -> `manifold.obj`, `coacd.obj`
   - convex export -> `meshes/coacd_convex_piece_*.obj`
   - `mesh_simplify` -> `simplified.obj` (default skip when exists)
   - `mesh_visual` -> `visual.obj` + optional visual material/texture compression outputs
+    - textured input is canonical single texture (`textured.mtl + texture_map.png`) and outputs single `visual_texture_map.*`
+    - visual geometry is decimated from `inertia.obj` (fallback to `raw.obj` only if `inertia.obj` is missing)
+    - object is marked success only if generated `visual.obj` can be loaded as a non-empty scene with valid bounds
 - Default behavior:
   - step-level skip where outputs already exist
   - `--force` recomputes all steps
@@ -111,11 +119,13 @@ Build `third_party/CoACD` and `third_party/ACVD` binaries before running `proces
 - Preserve dataset-agnostic path conventions under `assets/objects/{raw,processed}`.
 - Manifest mass policy: if source mass is unknown, write `mass_kg=0.1` in manifest.
 - Manifest texture policy: `has_texture` is determined only by whether `.png` texture files exist in the organized object folder.
+- Organized texture files must be `.png`; if source texture is non-png (e.g. `.jpg`), convert to `.png` during organize and do not keep the original non-png copy.
 - Organized asset canonical naming:
   - mesh: `raw.obj`
   - texture: `texture_map.png`
   - material: `textured.mtl`
   - `textured.mtl` should reference `texture_map.png` (`map_Kd texture_map.png`).
+  - ShapeNetSem/ShapeNetCore default organize mode is OBJ-only; optional texture export can be enabled by env and is then canonicalized to single `texture_map.png`.
 - Organized object id naming:
   - default convention is `<SourceName>_<object_name>` (sanitize via `sanitize_object_id`).
   - handle collisions by suffix (`_2`, `_3`, ...).
@@ -148,6 +158,7 @@ Build `third_party/CoACD` and `third_party/ACVD` binaries before running `proces
   2. run `process_meshes.py --dataset <source>`,
   3. run `build_object_descriptions.py --dataset <source>`.
 - Verify outputs per object: `inertia.obj`, `manifold.obj`, `meshes/*.obj`, `simplified.obj`, `visual.obj`, optional `visual.mtl`, optional `visual_texture_map.*`, `.urdf`, `.xml`.
+  - For textured objects, current expectation is single visual texture file (`visual_texture_map.*`).
 
 ## Manifest Format
 
@@ -171,6 +182,7 @@ Build `third_party/CoACD` and `third_party/ACVD` binaries before running `proces
 - Use concise imperative commit messages (existing history: `Update proc.py`, `[add] preprocess YCB models`).
 - Recommended format: `<scope>: <change>` (example: `objaverse: fix robust downloader path handling`).
 - PRs should include changed dataset(s), commands executed, and sample output paths.
+- Remote rule (SSH): `git remote set-url origin git@github.com:HomeworldL/mesh_process.git`
 
 ## Data & Security Notes
 

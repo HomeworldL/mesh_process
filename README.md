@@ -53,10 +53,11 @@ Optional:
 ```bash
 python src/visualize_obj.py --dataset RealDex --seed 42
 python src/visualize_obj.py --dataset YCB --mesh-type visual
+python src/visualize_obj.py --dataset YCB --mesh-type inertia
 ```
 
 Notes:
-- `--mesh-type raw|visual` chooses `raw.obj` or `visual.obj`.
+- `--mesh-type raw|inertia|visual` chooses `raw.obj` / `inertia.obj` / `visual.obj`.
 - If `--object-id` is provided, it visualizes exactly that object folder.
 
 MuJoCo MJCF visualization:
@@ -118,6 +119,7 @@ Notes:
 - `organize` will build `assets/objects/processed/<dataset>/manifest.json` automatically.
 - `mass_kg` is included per object; when unknown, default value is `0.1`.
 - Canonical organized file names are: `raw.obj`, optional `texture_map.png`, optional `textured.mtl`.
+  - ShapeNetSem/ShapeNetCore default behavior is OBJ-only (`raw.obj` after normalization). Texture export is optional via env (`SHAPENET_EXPORT_TEXTURES=1` or source-specific switch).
 - ShapeNetCore / ShapeNetSem usually require terms acceptance and authenticated/manual archive retrieval.
 
 ## Dataset-Specific Structures
@@ -181,6 +183,18 @@ Notes:
 - Requires manual/authenticated archive acquisition.
 - Recommended flow: put archive under `assets/objects/raw/<dataset>/`, then run `download` + `organize`.
 - Organized output is normalized under `assets/objects/processed/<dataset>/`.
+- ShapeNetCore details:
+  - `download`: selective extraction from `ShapeNetCore.v2.zip` using `filter_lists.py` (allowed synsets + denylist ids), only keeps `model_normalized.{obj,mtl,json}` and referenced `images/*`.
+  - `organize`: load each OBJ then normalize geometry (AABB center -> origin, max extent -> `1.0`), drop abnormal meshes.
+  - texture export is optional (default off): set `SHAPENET_CORE_EXPORT_TEXTURES=1` or `SHAPENET_EXPORT_TEXTURES=1`; exported textures are canonicalized to single `texture_map.png` + `textured.mtl`.
+- ShapeNetSem details:
+  - `download`: metadata + filtered `models-OBJ` (obj/mtl) + full `models-textures`.
+  - `organize`: load each OBJ then normalize geometry (AABB center -> origin, max extent -> `1.0`), drop abnormal meshes.
+  - texture export is optional (default off): set `SHAPENET_SEM_EXPORT_TEXTURES=1` or `SHAPENET_EXPORT_TEXTURES=1`; exported textures are canonicalized to single `texture_map.png` + `textured.mtl`.
+  - abnormal-mesh rejection thresholds:
+    - pre-normalization `max_extent <= 1e-9`, or pre-normalization aspect ratio (`max_extent / min_extent`) `> 1e5`
+    - post-normalization `max_extent` not in `[0.95, 1.05]`
+    - post-normalization AABB center norm `> 5e-3`
 
 ## Stage 2: Process Meshes (`process_meshes.py`)
 
@@ -192,10 +206,14 @@ python src/process_meshes.py --dataset YCB --workers 8
 
 Flow per object:
 - `mesh_transform` (always runs): regenerate `inertia.obj` and inertial principal data.
+  - principal-axis assignment now selects signed/permuted axes that remain close to original XYZ orientation while still aligning to principal directions.
 - `mesh_manifold_and_convex_decomp`: generate `manifold.obj` + `coacd.obj`.
 - convex export: write `meshes/coacd_convex_piece_*.obj`.
 - `mesh_simplify`: generate `simplified.obj` (skip if exists unless `--force`).
 - `mesh_visual`: generate compressed visual assets (`visual.obj`, optional `visual.mtl`, optional `visual_texture_map.*`) with geometry decimation + OBJ text slimming + texture compression.
+  - visual geometry is decimated from `inertia.obj` (fallback `raw.obj` if missing).
+  - Textured objects are treated as canonical single-texture input (`textured.mtl + texture_map.png`) and produce one `visual_texture_map.*`.
+  - before marking an object as success, Stage-2 validates that `visual.obj` is loadable as a non-empty scene with valid bounds.
 
 Parallel and overwrite behavior:
 - Default is step-level skip where applicable.
