@@ -441,6 +441,18 @@ class ShapeNetSemAdapter(_ShapeNetHFBaseAdapter):
                     if baked_ok:
                         baked_single_texture += 1
 
+                # Enforce final canonical output: raw.obj + optional single texture_map.png/textured.mtl.
+                tex_candidates = sorted(p for p in dst_dir.glob("*.png") if p.is_file())
+                tex_pick = tex_candidates[0] if tex_candidates else None
+                mtl_pick = canonical_mtl if canonical_mtl.is_file() else None
+                canonicalize_texture_assets(
+                    dst_dir=dst_dir,
+                    raw_obj_path=dst_obj,
+                    texture_src=tex_pick,
+                    mtl_src=mtl_pick,
+                    create_mtl_if_texture=True,
+                )
+
             report.organized_objects += 1
 
         report.notes.append(f"organized from extracted root: {relative_to_repo(cfg.repo_root, sem_root)}")
