@@ -86,6 +86,25 @@ def parse_first_usemtl(obj_path):
     return "material_0"
 
 
+def parse_first_newmtl(mtl_path):
+    if not os.path.exists(mtl_path):
+        return None
+    try:
+        with open(mtl_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                s = line.strip()
+                if not s:
+                    continue
+                parts = s.split(maxsplit=1)
+                if len(parts) == 2 and parts[0].lower() == "newmtl":
+                    name = parts[1].strip()
+                    if name:
+                        return name
+    except Exception:
+        pass
+    return None
+
+
 def parse_first_texture_from_mtl(mtl_path):
     if not os.path.exists(mtl_path):
         return None
@@ -103,6 +122,58 @@ def parse_first_texture_from_mtl(mtl_path):
     except Exception:
         pass
     return None
+
+
+def parse_texture_refs_from_mtl(mtl_path):
+    refs = []
+    if not os.path.exists(mtl_path):
+        return refs
+    try:
+        with open(mtl_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith("#"):
+                    continue
+                parts = s.split()
+                if len(parts) < 2:
+                    continue
+                key = parts[0].lower()
+                if key.startswith("map_") or key == "bump":
+                    tex = os.path.basename(parts[-1].strip())
+                    if tex and tex not in refs:
+                        refs.append(tex)
+    except Exception:
+        pass
+    return refs
+
+
+def rewrite_visual_mtl_with_texture_map(src_mtl, dst_mtl, remap):
+    """Rewrite map_* and bump texture filenames in MTL using remap dict."""
+    if not os.path.exists(src_mtl):
+        return False
+    out_lines = []
+    rewritten = False
+    with open(src_mtl, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            s = line.strip()
+            if not s or s.startswith("#"):
+                out_lines.append(line)
+                continue
+            parts = s.split()
+            if len(parts) >= 2:
+                key = parts[0].lower()
+                if key.startswith("map_") or key == "bump":
+                    tex = os.path.basename(parts[-1].strip())
+                    if tex in remap:
+                        parts[-1] = remap[tex]
+                        leading = re.match(r"^\s*", line).group(0)
+                        out_lines.append(f"{leading}{' '.join(parts)}\n")
+                        rewritten = True
+                        continue
+            out_lines.append(line)
+    with open(dst_mtl, "w", encoding="utf-8") as f:
+        f.writelines(out_lines)
+    return rewritten
 
 
 def copy_and_patch_mtl(src_obj, dst_obj_dir):
@@ -276,14 +347,57 @@ def compute_principal(mesh, mass_override=None):
     return com, w, v, mass, vol, I
 
 
-def build_alignment_T(com, principal_axes):
-    R = np.asarray(principal_axes, dtype=float)
-    if np.linalg.det(R) < 0:
-        R[:, -1] *= -1.0
+def _best_aligned_principal_frame(principal_axes):
+    """
+    Choose signed/permuted principal axes that stay close to original XYZ.
+    This preserves principal-axis alignment while avoiding abrupt axis relabeling.
+    """
+    base = np.asarray(principal_axes, dtype=float)
+    best_frame = None
+    best_perm = None
+    best_score = -np.inf
+    # Permutation without itertools keeps import surface small.
+    perms = (
+        (0, 1, 2),
+        (0, 2, 1),
+        (1, 0, 2),
+        (1, 2, 0),
+        (2, 0, 1),
+        (2, 1, 0),
+    )
+    for perm in perms:
+        p = base[:, perm]
+        for sx in (-1.0, 1.0):
+            for sy in (-1.0, 1.0):
+                for sz in (-1.0, 1.0):
+                    s = np.diag([sx, sy, sz])
+                    cand = p @ s
+                    if np.linalg.det(cand) <= 0:
+                        continue
+                    # Equivalent to maximizing axis-wise cosine to original XYZ.
+                    score = float(np.trace(cand))
+                    if score > best_score:
+                        best_score = score
+                        best_frame = cand
+                        best_perm = perm
+    if best_frame is None:
+        best_frame = base.copy()
+        if np.linalg.det(best_frame) < 0:
+            best_frame[:, -1] *= -1.0
+        best_perm = (0, 1, 2)
+    return best_frame, best_perm
+
+
+def build_alignment_T(com, principal_axes, principal_moments=None):
+    R, perm = _best_aligned_principal_frame(principal_axes)
     T = np.eye(4, dtype=float)
     T[:3, :3] = R.T
     T[:3, 3] = -R.T @ np.asarray(com, dtype=float)
-    return T
+    out = {"T": T, "aligned_axes": R, "perm": perm}
+    if principal_moments is not None:
+        w = np.asarray(principal_moments, dtype=float)
+        out["aligned_moments"] = w[list(perm)].tolist()
+    return out
 
 
 # -------------------------
@@ -453,19 +567,21 @@ def mesh_compress_texture(src_tex, dst_tex, max_size=1024, jpg_quality=85):
 def mesh_visual(obj_dir, args):
     """
     Build compressed visual assets for MuJoCo loading speed:
-      raw.obj -> visual.obj
-      textured.mtl/texture -> visual.mtl + visual_texture_map.(jpg|png)
+      inertia.obj (fallback raw.obj) -> visual.obj
+      textured.mtl/texture_map.png -> visual.mtl + visual_texture_map.(jpg|png)
     This function never overwrites raw.obj.
     """
     obj_dir = Path(obj_dir)
-    src_obj = obj_dir / "raw.obj"
+    src_obj = obj_dir / "inertia.obj"
     if not src_obj.exists():
-        raise RuntimeError(f"raw.obj missing: {src_obj}")
+        src_obj = obj_dir / "raw.obj"
+    if not src_obj.exists():
+        raise RuntimeError(f"inertia/raw obj missing: {src_obj}")
 
     visual_obj = obj_dir / "visual.obj"
     tmp_decimated = obj_dir / "visual.decimated.tmp.obj"
     visual_mtl = obj_dir / "visual.mtl"
-    for stale in [obj_dir / "visual_texture_map.jpg", obj_dir / "visual_texture_map.png"]:
+    for stale in list(obj_dir.glob("visual_texture_map*.jpg")) + list(obj_dir.glob("visual_texture_map*.png")):
         stale.unlink(missing_ok=True)
 
     # Step A: geometry compression (prefer texture-aware pymeshlab).
@@ -475,41 +591,56 @@ def mesh_visual(obj_dir, args):
         target_faces=int(args.visual_target_faces),
     )
 
-    # Step B: texture discovery from existing canonical files.
+    # Step B: canonical single-texture discovery.
     src_mtl = obj_dir / "textured.mtl"
-    src_tex = obj_dir / "texture_map.png"
-    if src_mtl.exists():
-        tex_in_mtl = parse_first_texture_from_mtl(str(src_mtl))
-        if tex_in_mtl:
-            candidate = obj_dir / os.path.basename(tex_in_mtl)
-            if candidate.exists():
-                src_tex = candidate
+    tex_name = None
+    tex_in_mtl = parse_first_texture_from_mtl(str(src_mtl)) if src_mtl.exists() else None
+    if tex_in_mtl:
+        tex_name = os.path.basename(tex_in_mtl)
+    elif (obj_dir / "texture_map.png").exists():
+        tex_name = "texture_map.png"
 
-    # Step C: texture compression to visual texture.
+    # Step C: texture compression to one visual texture.
     dst_tex_ext = ".jpg" if args.visual_texture_format == "jpg" else ".png"
-    dst_tex = obj_dir / f"visual_texture_map{dst_tex_ext}"
     texture_info = {"texture_mode": "none", "texture_path": None}
-    if src_tex.exists():
-        texture_info = mesh_compress_texture(
-            str(src_tex),
-            str(dst_tex),
-            max_size=int(args.visual_texture_max_size),
-            jpg_quality=int(args.visual_jpeg_quality),
-        )
-        tex_path = texture_info.get("texture_path")
-        if tex_path:
-            dst_tex = Path(tex_path)
+    produced_visual_textures = []
+    remap = {}
+    if tex_name is not None:
+        src_tex = obj_dir / os.path.basename(tex_name)
+        if src_tex.exists():
+            dst_tex = obj_dir / f"visual_texture_map{dst_tex_ext}"
+            info = mesh_compress_texture(
+                str(src_tex),
+                str(dst_tex),
+                max_size=int(args.visual_texture_max_size),
+                jpg_quality=int(args.visual_jpeg_quality),
+            )
+            tex_path = info.get("texture_path")
+            if tex_path:
+                out_name = Path(tex_path).name
+                remap[os.path.basename(tex_name)] = out_name
+                produced_visual_textures.append(Path(tex_path))
+                texture_info = info
 
     # Step D: write visual.mtl when texture exists.
     material_name = parse_first_usemtl(str(tmp_decimated))
     if not material_name:
         material_name = "material_0"
-    if dst_tex.exists():
-        tex_name = dst_tex.name
-        with open(visual_mtl, "w", encoding="utf-8") as f:
-            f.write(f"newmtl {material_name}\n")
-            f.write("# shader_type beckmann\n")
-            f.write(f"map_Kd {tex_name}\n")
+    if produced_visual_textures:
+        rewritten = False
+        if src_mtl.exists():
+            rewritten = rewrite_visual_mtl_with_texture_map(str(src_mtl), str(visual_mtl), remap)
+            if rewritten:
+                first_newmtl = parse_first_newmtl(str(visual_mtl))
+                if first_newmtl:
+                    # Keep visual.obj/usemtl consistent with rewritten visual.mtl.
+                    material_name = first_newmtl
+        if not rewritten:
+            tex_name = produced_visual_textures[0].name
+            with open(visual_mtl, "w", encoding="utf-8") as f:
+                f.write(f"newmtl {material_name}\n")
+                f.write("# shader_type beckmann\n")
+                f.write(f"map_Kd {tex_name}\n")
         force_mtllib = visual_mtl.name
     else:
         force_mtllib = None
@@ -525,11 +656,12 @@ def mesh_visual(obj_dir, args):
         force_usemtl=material_name if force_mtllib is not None else None,
     )
     tmp_decimated.unlink(missing_ok=True)
+    (obj_dir / f"{tmp_decimated.name}.mtl").unlink(missing_ok=True)
 
     return {
         "visual_obj": str(visual_obj),
         "visual_mtl": str(visual_mtl) if visual_mtl.exists() else None,
-        "visual_texture": str(dst_tex) if dst_tex.exists() else None,
+        "visual_texture": str(produced_visual_textures[0]) if produced_visual_textures else None,
         "decimated_with": "pymeshlab",
         "decimate_note": None,
         "texture_mode": texture_info.get("texture_mode"),
@@ -583,7 +715,8 @@ def mesh_transform(
             f"    princ_moments (ordered, largest->Z): {np.round(princ_w,9).tolist()}"
         )
 
-    T = build_alignment_T(com, princ_v)
+    align = build_alignment_T(com, princ_v, principal_moments=princ_w)
+    T = align["T"]
 
     # copy and patch mtl/textures into dst_inertia_dir
     mtllib_map = copy_and_patch_mtl(src_obj, dst_inertia_dir)
@@ -595,8 +728,8 @@ def mesh_transform(
 
     return {
         "com": com.tolist(),
-        "princ_w": princ_w.tolist(),
-        "princ_v": princ_v.tolist(),
+        "princ_w": align.get("aligned_moments", princ_w.tolist()),
+        "princ_v": align["aligned_axes"].tolist(),
     }
 
 
@@ -633,15 +766,43 @@ def _convex_pieces_exist(meshes_dir: Path) -> bool:
 def _visual_outputs_exist(obj_dir: Path) -> bool:
     visual_obj = obj_dir / "visual.obj"
     visual_mtl = obj_dir / "visual.mtl"
-    visual_tex_jpg = obj_dir / "visual_texture_map.jpg"
-    visual_tex_png = obj_dir / "visual_texture_map.png"
-    if not visual_obj.exists():
+    if (not visual_obj.exists()) or visual_obj.stat().st_size <= 0:
         return False
-    # For textured objects visual.mtl + visual_texture_map are expected.
-    if (obj_dir / "texture_map.png").exists():
-        return visual_mtl.exists() and (visual_tex_jpg.exists() or visual_tex_png.exists())
+    # For textured objects visual.mtl + visual_texture_map* are expected.
+    textured_mtl = obj_dir / "textured.mtl"
+    if textured_mtl.exists():
+        visual_tex_files = []
+        for name in ("visual_texture_map.jpg", "visual_texture_map.png"):
+            p = obj_dir / name
+            if p.exists():
+                visual_tex_files.append(p)
+        has_visual_tex = any(p.stat().st_size > 0 for p in visual_tex_files)
+        return visual_mtl.exists() and visual_mtl.stat().st_size > 0 and has_visual_tex
     # For non-textured objects only visual.obj is required.
     return True
+
+
+def validate_visual_obj_loadable(obj_dir: Path) -> tuple[bool, str | None]:
+    visual_obj = obj_dir / "visual.obj"
+    if (not visual_obj.exists()) or visual_obj.stat().st_size <= 0:
+        return False, f"visual.obj missing or empty: {visual_obj}"
+    try:
+        scene = trimesh.load(str(visual_obj), process=False, force="scene")
+    except Exception as e:
+        return False, f"failed to load visual.obj: {e}"
+    geoms = getattr(scene, "geometry", {})
+    if not geoms:
+        return False, "visual.obj loaded as empty scene (no geometry)"
+    try:
+        bounds = scene.bounds
+    except Exception as e:
+        return False, f"failed to read visual bounds: {e}"
+    if bounds is None:
+        return False, "visual scene bounds is None"
+    bounds = np.asarray(bounds, dtype=float)
+    if bounds.shape != (2, 3) or (not np.all(np.isfinite(bounds))):
+        return False, f"visual scene bounds invalid: shape={bounds.shape}"
+    return True, None
 
 
 def process_object(
@@ -772,13 +933,15 @@ def process_object(
             mesh_visual(obj_dir=str(obj_dir), args=argparse.Namespace(**process_cfg))
         visual_obj = obj_dir / "visual.obj"
         visual_mtl = obj_dir / "visual.mtl"
-        visual_tex = next(
-            (p for p in [obj_dir / "visual_texture_map.jpg", obj_dir / "visual_texture_map.png"] if p.exists()),
-            None,
-        )
+        visual_tex = next(iter(sorted(obj_dir.glob("visual_texture_map*.jpg"))), None)
+        if visual_tex is None:
+            visual_tex = next(iter(sorted(obj_dir.glob("visual_texture_map*.png"))), None)
         rec["visual_obj_path"] = str(visual_obj) if visual_obj.exists() else None
         rec["visual_mtl_path"] = str(visual_mtl) if visual_mtl.exists() else None
         rec["visual_texture_path"] = str(visual_tex) if visual_tex is not None else None
+        ok, reason = validate_visual_obj_loadable(obj_dir)
+        if not ok:
+            raise RuntimeError(f"visual validation failed: {reason}")
     except Exception as e:
         rec["error"] = f"visual mesh failed: {e}"
         print(f"    ERROR: {rec['error']}")
@@ -1035,7 +1198,7 @@ def parse_args():
         "--visual-target-faces",
         type=int,
         default=20000,
-        help="Visual mesh decimation target face count (from raw.obj).",
+        help="Visual mesh decimation target face count (from inertia.obj, fallback raw.obj).",
     )
     p.add_argument(
         "--visual-obj-decimals",

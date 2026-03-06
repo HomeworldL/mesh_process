@@ -23,7 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mesh-type",
         type=str,
-        choices=["raw", "visual"],
+        choices=["raw", "inertia", "visual"],
         default="raw",
         help="Choose which canonical mesh to display.",
     )
@@ -49,7 +49,12 @@ def main() -> None:
     if args.seed is not None:
         random.seed(args.seed)
 
-    target_name = "raw.obj" if args.mesh_type == "raw" else "visual.obj"
+    if args.mesh_type == "raw":
+        target_name = "raw.obj"
+    elif args.mesh_type == "inertia":
+        target_name = "inertia.obj"
+    else:
+        target_name = "visual.obj"
 
     if args.object_id:
         obj_dir = dataset_dir / args.object_id
@@ -70,6 +75,21 @@ def main() -> None:
     print(f"[visualize] selected={chosen}")
 
     scene_or_mesh = trimesh.load(chosen, process=False, force="scene")
+    geometry = getattr(scene_or_mesh, "geometry", {})
+    if not geometry:
+        raise RuntimeError(
+            f"Loaded scene has no geometry: {chosen}. "
+            "Please rerun stage-2 with --force to regenerate visual assets."
+        )
+    try:
+        bounds = scene_or_mesh.bounds
+    except Exception as e:
+        raise RuntimeError(f"Failed to read scene bounds for {chosen}: {e}") from e
+    if bounds is None:
+        raise RuntimeError(
+            f"Scene bounds is None for {chosen}. "
+            "Please rerun stage-2 with --force to regenerate visual assets."
+        )
     scene_or_mesh.show()
 
 
