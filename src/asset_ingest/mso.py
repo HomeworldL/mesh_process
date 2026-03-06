@@ -18,6 +18,7 @@ from .base import (
     relative_to_repo,
     sanitize_object_id,
 )
+from .filter_lists import MSO_BAD_INSTANCES
 from .manifest import IngestManifest, ManifestSource, ManifestSummary, ObjectRecord
 
 
@@ -116,6 +117,8 @@ class MSOAdapter(BaseIngestAdapter):
 
         seen_ids: set[str] = set()
         for folder in sorted(p for p in src_root.iterdir() if p.is_dir()):
+            if folder.name in MSO_BAD_INSTANCES:
+                continue
             src_obj = folder / "model.obj"
             if not src_obj.is_file():
                 continue

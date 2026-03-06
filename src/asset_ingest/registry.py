@@ -10,7 +10,8 @@ from .kit import KITAdapter
 from .mso import MSOAdapter
 from .objaverse import ObjaverseAdapter
 from .realdex import RealDexAdapter
-from .shapenet import ShapeNetCoreAdapter, ShapeNetSemAdapter
+from .shapenet_core import ShapeNetCoreAdapter
+from .shapenet_sem import ShapeNetSemAdapter
 from .ycb import YCBAdapter
 
 
