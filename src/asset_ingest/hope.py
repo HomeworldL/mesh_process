@@ -25,6 +25,7 @@ from .manifest import IngestManifest, ManifestSource, ManifestSummary, ObjectRec
 class HOPEAdapter(BaseIngestAdapter):
     source_name = "HOPE"
     version = None
+    mesh_scale = 0.01  # HOPE raw meshes are in centimeters; organize to meters.
 
     folder_url = "https://drive.google.com/drive/folders/1jiJS9KgcYAkfb8KJPp5MRlB0P11BStft"
     download_dirname = "hope_objects"
@@ -232,6 +233,35 @@ class HOPEAdapter(BaseIngestAdapter):
             return nested[0]
         return source_dir
 
+    @staticmethod
+    def _scale_obj_vertices(obj_path: Path, scale: float) -> int:
+        """Scale OBJ `v` lines in-place and return count of scaled vertices."""
+        lines = obj_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        out_lines: list[str] = []
+        scaled = 0
+        for line in lines:
+            if not line.startswith("v "):
+                out_lines.append(line)
+                continue
+            parts = line.split()
+            if len(parts) < 4:
+                out_lines.append(line)
+                continue
+            try:
+                x = float(parts[1]) * scale
+                y = float(parts[2]) * scale
+                z = float(parts[3]) * scale
+            except ValueError:
+                out_lines.append(line)
+                continue
+
+            # Keep optional per-vertex color/weight terms intact.
+            out_lines.append(" ".join(["v", f"{x:.9g}", f"{y:.9g}", f"{z:.9g}", *parts[4:]]))
+            scaled += 1
+
+        obj_path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+        return scaled
+
     def download(self, cfg: IngestConfig) -> DownloadReport:
         out_dir = cfg.source_download_dir
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -310,6 +340,9 @@ class HOPEAdapter(BaseIngestAdapter):
                 continue
 
             shutil.copy2(src_obj, dst_obj)
+            scaled_vertices = self._scale_obj_vertices(dst_obj, self.mesh_scale)
+            if scaled_vertices == 0:
+                raise RuntimeError(f"HOPE organize failed to scale mesh (no vertices found): {dst_obj}")
             mtl_src = mesh_dir / "textured.mtl"
             tex_src = mesh_dir / "texture_map.png"
             canonicalize_texture_assets(
@@ -322,6 +355,7 @@ class HOPEAdapter(BaseIngestAdapter):
             report.organized_objects += 1
 
         report.notes.append(f"organized from {src_root}")
+        report.notes.append("scaled raw.obj by 0.01 (cm->m)")
         self.write_manifest_for_organize(cfg, report)
         return report
 
