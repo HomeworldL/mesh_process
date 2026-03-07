@@ -208,3 +208,4 @@ __marimo__/
 
 assets/*
 tmp/
+scripts/run_stage_seq.sh

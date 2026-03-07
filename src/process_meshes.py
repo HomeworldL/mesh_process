@@ -20,6 +20,7 @@ import shutil
 import re
 import json
 import time
+import subprocess
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -408,24 +409,56 @@ def mesh_manifold_and_convex_decomp(
     manifold_output_path,
     coacd_output_path,
     quiet=False,
+    timeout_sec=None,
 ):
-    # uses your provided command template
-    cmd = f"third_party/CoACD/build/main -i {input_path} -o {coacd_output_path} -ro {manifold_output_path} -pm on"
+    cmd = [
+        "third_party/CoACD/build/main",
+        "-i",
+        str(input_path),
+        "-o",
+        str(coacd_output_path),
+        "-ro",
+        str(manifold_output_path),
+        "-pm",
+        "on",
+    ]
+    print("  [CoACD] running:", " ".join(cmd) if not quiet else "coacd (quiet mode)")
+    run_kwargs = {}
     if quiet:
-        cmd += " > /dev/null 2>&1"
-    print("  [CoACD] running:", cmd if not quiet else "coacd (quiet mode)")
+        run_kwargs["stdout"] = subprocess.DEVNULL
+        run_kwargs["stderr"] = subprocess.DEVNULL
+    try:
+        proc = subprocess.run(cmd, timeout=timeout_sec, check=False, **run_kwargs)
+        return int(proc.returncode)
+    except subprocess.TimeoutExpired:
+        return 124
 
-    return os.system(cmd)
 
-
-def mesh_simplify(input_path, output_path, vert_num=4000, gradation=0.5, quiet=False):
+def mesh_simplify(input_path, output_path, vert_num=4000, gradation=0.5, quiet=False, timeout_sec=None):
     out_dir = os.path.dirname(output_path)
     out_basename = os.path.basename(output_path)
-    cmd = f"third_party/ACVD/bin/ACVD {input_path} {vert_num} {gradation} -o {out_dir+os.sep} -of {out_basename} -m 1"
+    cmd = [
+        "third_party/ACVD/bin/ACVD",
+        str(input_path),
+        str(int(vert_num)),
+        str(float(gradation)),
+        "-o",
+        str(out_dir + os.sep),
+        "-of",
+        str(out_basename),
+        "-m",
+        "1",
+    ]
+    print("  [ACVD] running:", " ".join(cmd) if not quiet else "acvd (quiet mode)")
+    run_kwargs = {}
     if quiet:
-        cmd += " > /dev/null 2>&1"
-    print("  [ACVD] running:", cmd if not quiet else "acvd (quiet mode)")
-    os.system(cmd)
+        run_kwargs["stdout"] = subprocess.DEVNULL
+        run_kwargs["stderr"] = subprocess.DEVNULL
+    try:
+        proc = subprocess.run(cmd, timeout=timeout_sec, check=False, **run_kwargs)
+        ret = int(proc.returncode)
+    except subprocess.TimeoutExpired:
+        ret = 124
     # ACVD may create 'smooth_filename' intermediate; attempt to remove if present
     smooth_p = os.path.join(out_dir, f"smooth_{out_basename}")
     if os.path.exists(smooth_p):
@@ -433,7 +466,7 @@ def mesh_simplify(input_path, output_path, vert_num=4000, gradation=0.5, quiet=F
             os.remove(smooth_p)
         except Exception:
             pass
-    return 0
+    return ret
 
 
 def mesh_decimate_with_pymeshlab(src_obj, dst_obj, target_faces):
@@ -869,6 +902,7 @@ def process_object(
                 str(dst_manifold_obj),
                 str(dst_coacd_obj),
                 quiet=bool(process_cfg["coacd_quiet"]),
+                timeout_sec=float(process_cfg["coacd_timeout_sec"]) if process_cfg["coacd_timeout_sec"] else None,
             )
             if ret != 0 or (not dst_coacd_obj.exists()):
                 raise RuntimeError(f"CoACD failed (ret={ret})")
@@ -910,15 +944,16 @@ def process_object(
                 if dst_manifold_obj.exists()
                 else (dst_inertia_obj if dst_inertia_obj.exists() else src_obj)
             )
-            mesh_simplify(
+            ret = mesh_simplify(
                 in_for_acvd,
                 str(dst_simplified_obj),
                 vert_num=int(process_cfg["acvd_vertnum"]),
                 gradation=float(process_cfg["acvd_gradation"]),
                 quiet=bool(process_cfg["acvd_quiet"]),
+                timeout_sec=float(process_cfg["acvd_timeout_sec"]) if process_cfg["acvd_timeout_sec"] else None,
             )
-            if not dst_simplified_obj.exists():
-                raise RuntimeError("ACVD finished but simplified.obj missing")
+            if ret != 0 or (not dst_simplified_obj.exists()):
+                raise RuntimeError(f"ACVD failed (ret={ret}); simplified.obj missing")
     except Exception as e:
         rec["error"] = f"ACVD failed: {e}"
         print(f"    ERROR: {rec['error']}")
@@ -1061,6 +1096,8 @@ def process_dataset(dataset_root: Path, args: argparse.Namespace) -> None:
         "verbose": bool(args.verbose),
         "coacd_quiet": bool(args.coacd_quiet),
         "acvd_quiet": bool(args.acvd_quiet),
+        "coacd_timeout_sec": (float(args.coacd_timeout_sec) if float(args.coacd_timeout_sec) > 0 else None),
+        "acvd_timeout_sec": (float(args.acvd_timeout_sec) if float(args.acvd_timeout_sec) > 0 else None),
         "acvd_vertnum": int(args.acvd_vertnum),
         "acvd_gradation": float(args.acvd_gradation),
         "visual_target_faces": int(args.visual_target_faces),
@@ -1186,8 +1223,32 @@ def parse_args():
         help="Show trimesh preview for inertia step (requires GUI)",
     )
     p.add_argument("--verbose", action="store_true", help="Verbose output")
-    p.add_argument("--coacd-quiet", action="store_true", help="Run CoACD quietly")
-    p.add_argument("--acvd-quiet", action="store_true", help="Run ACVD quietly")
+    p.add_argument(
+        "--coacd-quiet",
+        dest="coacd_quiet",
+        action="store_true",
+        default=True,
+        help="Run CoACD quietly (default: enabled).",
+    )
+    p.add_argument(
+        "--acvd-quiet",
+        dest="acvd_quiet",
+        action="store_true",
+        default=True,
+        help="Run ACVD quietly (default: enabled).",
+    )
+    p.add_argument(
+        "--coacd-timeout-sec",
+        type=float,
+        default=100.0,
+        help="Timeout for CoACD per object in seconds (default: 1800). Set <=0 to disable.",
+    )
+    p.add_argument(
+        "--acvd-timeout-sec",
+        type=float,
+        default=100.0,
+        help="Timeout for ACVD per object in seconds (default: 1800). Set <=0 to disable.",
+    )
     p.add_argument(
         "--acvd-vertnum", type=int, default=2000, help="ACVD: target vertex number"
     )
