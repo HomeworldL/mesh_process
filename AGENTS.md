@@ -29,6 +29,9 @@
   - abnormal-mesh drop thresholds in normalize step:
     - pre `max_extent <= 1e-9` or pre aspect ratio (`max_extent/min_extent`) `> 1e5`
     - post `max_extent` not in `[0.95, 1.05]` or post center norm `> 5e-3`
+- Normalization + default mass policy:
+  - normalized datasets: `ShapeNetCore`, `ShapeNetSem`, `DGN`, `DDG` -> default `mass_kg=10.0`
+  - non-normalized datasets: `YCB`, `RealDex`, `GraspNet`, `HOPE`, `KIT`, `MSO`, `Objaverse`, `DexNet` -> default `mass_kg=0.1`
 
 ## Build, Test, and Development Commands
 
@@ -121,7 +124,9 @@ Build `third_party/CoACD` and `third_party/ACVD` binaries before running `proces
 - Python 3, 4-space indentation, `snake_case` for functions/files, `PascalCase` for classes.
 - Keep scripts CLI-driven with `argparse`; avoid hardcoded machine-specific paths.
 - Preserve dataset-agnostic path conventions under `assets/objects/{raw,processed}`.
-- Manifest mass policy: if source mass is unknown, write `mass_kg=0.1` in manifest.
+- Manifest mass policy:
+  - normalized datasets (`ShapeNetCore`, `ShapeNetSem`, `DGN`, `DDG`): if source mass unknown, write `mass_kg=10.0`
+  - other datasets: if source mass unknown, write `mass_kg=0.1`
 - Manifest texture policy: `has_texture` is determined only by whether `.png` texture files exist in the organized object folder.
 - Organized texture files must be `.png`; if source texture is non-png (e.g. `.jpg`), convert to `.png` during organize and do not keep the original non-png copy.
 - Organized asset canonical naming:
@@ -141,7 +146,7 @@ Build `third_party/CoACD` and `third_party/ACVD` binaries before running `proces
 - Use `canonicalize_texture_assets(...)` during organize if texture/mtl may exist.
 - `manifest` path fields must use repo-relative paths via `relative_to_repo(...)`.
 - `has_texture` must follow `.png`-only policy.
-- If source mass is unavailable, always use `DEFAULT_MASS_KG` (`0.1`).
+- If source mass is unavailable, follow dataset policy above (`10.0` for normalized datasets; otherwise `0.1`).
 - Prefer `tqdm` for long loops (download and organize).
 
 ## Common Issues & References

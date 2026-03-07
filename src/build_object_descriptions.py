@@ -25,8 +25,6 @@ from dataclasses import dataclass
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
-from PIL import Image
-
 
 @dataclass
 class ObjectSpec:
@@ -46,24 +44,6 @@ class ObjectDescriptionBuilder:
         self.xml_base = ET.parse(str(xml_prototype)).getroot()
 
     @staticmethod
-    def _ensure_png_texture(obj_dir: Path) -> str | None:
-        png_path = obj_dir / "visual_texture_map.png"
-        if png_path.exists():
-            return png_path.name
-
-        for legacy_name in ("visual_texture_map.jpg", "visual_texture_map.jpeg"):
-            legacy_path = obj_dir / legacy_name
-            if not legacy_path.exists():
-                continue
-            try:
-                with Image.open(legacy_path) as img:
-                    img.save(png_path, format="PNG", optimize=True, compress_level=9)
-                return png_path.name
-            except Exception:
-                return None
-        return None
-
-    @staticmethod
     def _replace_xml_attributes(root: ET.Element, path: str, attrs: dict[str, str]) -> None:
         node = root.find(path)
         if node is None:
@@ -81,55 +61,57 @@ class ObjectDescriptionBuilder:
                 return p.parent
         return dataset_root / object_id
 
-    def _collect_specs(self, manifest: dict, selected_ids: set[str] | None, include_failed: bool) -> tuple[list[ObjectSpec], list[str]]:
+    def _collect_specs(self, manifest: dict, selected_ids: set[str] | None) -> list[ObjectSpec]:
         specs: list[ObjectSpec] = []
-        warnings: list[str] = []
 
         objects = manifest.get("objects", [])
         if not isinstance(objects, list):
-            return specs, ["manifest objects is not a list"]
+            raise RuntimeError("manifest objects is not a list")
 
         for rec in objects:
             if not isinstance(rec, dict):
-                continue
+                raise RuntimeError("manifest object entry is not a dict")
             object_id = rec.get("object_id")
             if not isinstance(object_id, str) or not object_id:
-                continue
+                raise RuntimeError(f"invalid object_id in manifest entry: {rec}")
             if selected_ids is not None and object_id not in selected_ids:
                 continue
 
             status = rec.get("process_status")
-            if status != "success" and not include_failed:
-                warnings.append(f"skip {object_id}: process_status={status}")
-                continue
+            if status != "success":
+                raise RuntimeError(f"{object_id}: process_status={status}, expected success")
 
             obj_dir = self._find_mesh_path_from_record(self.dataset_root, object_id, rec)
             visual_abs = obj_dir / "visual.obj"
             if not visual_abs.exists():
-                warnings.append(f"skip {object_id}: missing visual.obj")
-                continue
+                raise RuntimeError(f"{object_id}: missing visual.obj")
 
             collision_abs = sorted((obj_dir / "meshes").glob("coacd_convex_piece_*.obj"))
             if not collision_abs:
-                warnings.append(f"skip {object_id}: missing collision pieces in meshes/")
-                continue
+                raise RuntimeError(f"{object_id}: missing collision pieces in meshes/")
 
             mass_kg = rec.get("mass_kg")
             if not isinstance(mass_kg, (int, float)) or float(mass_kg) <= 0:
-                warnings.append(f"skip {object_id}: invalid mass_kg={mass_kg}")
-                continue
+                raise RuntimeError(f"{object_id}: invalid mass_kg={mass_kg}")
 
             pm = rec.get("principal_moments")
             if not isinstance(pm, list) or len(pm) != 3:
-                warnings.append(f"skip {object_id}: invalid principal_moments={pm}")
-                continue
+                raise RuntimeError(f"{object_id}: invalid principal_moments={pm}")
             try:
                 principal_moments = [float(pm[0]), float(pm[1]), float(pm[2])]
             except Exception:
-                warnings.append(f"skip {object_id}: non-numeric principal_moments={pm}")
-                continue
+                raise RuntimeError(f"{object_id}: non-numeric principal_moments={pm}")
 
-            visual_texture_rel = self._ensure_png_texture(obj_dir)
+            png_tex = obj_dir / "visual_texture_map.png"
+            jpg_tex = obj_dir / "visual_texture_map.jpg"
+            jpeg_tex = obj_dir / "visual_texture_map.jpeg"
+            has_png = png_tex.exists()
+            has_jpg = jpg_tex.exists() or jpeg_tex.exists()
+            if has_jpg and not has_png:
+                raise RuntimeError(
+                    f"{object_id}: non-png visual texture found; expected visual_texture_map.png only"
+                )
+            visual_texture_rel = "visual_texture_map.png" if has_png else None
 
             specs.append(
                 ObjectSpec(
@@ -143,7 +125,7 @@ class ObjectDescriptionBuilder:
                 )
             )
 
-        return specs, warnings
+        return specs
 
     def _update_urdf(self, spec: ObjectSpec) -> ET.Element:
         new_urdf = copy.deepcopy(self.urdf_base)
@@ -185,7 +167,7 @@ class ObjectDescriptionBuilder:
 
         return new_urdf
 
-    def _update_xml(self, spec: ObjectSpec, vis_collision: bool = False) -> ET.Element:
+    def _update_xml(self, spec: ObjectSpec) -> ET.Element:
         new_xml = copy.deepcopy(self.xml_base)
         new_xml.attrib["model"] = spec.object_id
 
@@ -238,22 +220,13 @@ class ObjectDescriptionBuilder:
             joint.attrib["name"] = f"{spec.object_id}_joint"
 
         if visual_geom is not None:
-            if vis_collision:
-                body_parent = new_xml.find(".//worldbody/body")
-                if body_parent is not None:
-                    body_parent.remove(visual_geom)
-            else:
-                visual_geom.attrib["name"] = f"{spec.object_id}_visual_geom"
-                visual_geom.attrib["mesh"] = f"{spec.object_id}_visual_mesh"
+            visual_geom.attrib["name"] = f"{spec.object_id}_visual_geom"
+            visual_geom.attrib["mesh"] = f"{spec.object_id}_visual_mesh"
 
         collision_geom = new_xml.find(".//geom[@name='_name_collision_geom']")
         if collision_geom is not None:
             collision_geom.attrib["name"] = f"{spec.object_id}_collision_geom_0"
             collision_geom.attrib["mesh"] = f"{spec.object_id}_collision_mesh_0"
-            if vis_collision:
-                collision_geom.attrib["contype"] = "0"
-                collision_geom.attrib["conaffinity"] = "0"
-                collision_geom.attrib["group"] = "0"
 
         inertial = new_xml.find(".//inertial")
         if inertial is not None:
@@ -284,7 +257,7 @@ class ObjectDescriptionBuilder:
         out_path.write_bytes(ET.tostring(root))
         return True
 
-    def build(self, object_ids: set[str] | None, force: bool, include_failed: bool, vis_collision: bool) -> dict:
+    def build(self, object_ids: set[str] | None, force: bool) -> dict:
         manifest_path = self.dataset_root / "manifest.process_meshes.json"
         if not manifest_path.exists():
             raise FileNotFoundError(
@@ -294,32 +267,25 @@ class ObjectDescriptionBuilder:
         with open(manifest_path, "r", encoding="utf-8") as f:
             manifest = json.load(f)
 
-        specs, warnings = self._collect_specs(
+        specs = self._collect_specs(
             manifest=manifest,
             selected_ids=object_ids,
-            include_failed=include_failed,
         )
 
         built = 0
         skipped = 0
-        failed = 0
-        errors: list[str] = []
 
         for spec in specs:
-            try:
-                urdf_root = self._update_urdf(spec)
-                xml_root = self._update_xml(spec, vis_collision=vis_collision)
-                urdf_path = spec.obj_dir / f"{spec.object_id}.urdf"
-                xml_path = spec.obj_dir / f"{spec.object_id}.xml"
-                w1 = self._save_xml(urdf_root, urdf_path, force=force)
-                w2 = self._save_xml(xml_root, xml_path, force=force)
-                if w1 or w2:
-                    built += 1
-                else:
-                    skipped += 1
-            except Exception as e:
-                failed += 1
-                errors.append(f"{spec.object_id}: {e}")
+            urdf_root = self._update_urdf(spec)
+            xml_root = self._update_xml(spec)
+            urdf_path = spec.obj_dir / f"{spec.object_id}.urdf"
+            xml_path = spec.obj_dir / f"{spec.object_id}.xml"
+            w1 = self._save_xml(urdf_root, urdf_path, force=force)
+            w2 = self._save_xml(xml_root, xml_path, force=force)
+            if w1 or w2:
+                built += 1
+            else:
+                skipped += 1
 
         return {
             "dataset": self.dataset_root.name,
@@ -327,9 +293,7 @@ class ObjectDescriptionBuilder:
             "num_candidates": len(specs),
             "num_built": built,
             "num_skipped": skipped,
-            "num_failed": failed,
-            "warnings": warnings,
-            "errors": errors,
+            "num_failed": 0,
         }
 
 
@@ -348,8 +312,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prototype-xml", type=Path, default=repo_root / "src" / "_prototype.xml")
     parser.add_argument("--object-id", type=str, default=None, help="Comma-separated object ids to build.")
     parser.add_argument("--force", action="store_true", help="Overwrite existing urdf/xml.")
-    parser.add_argument("--include-failed", action="store_true", help="Include objects not marked success in manifest.process_meshes.json.")
-    parser.add_argument("--vis-collision", action="store_true", help="Render collision meshes as visual geoms in MJCF.")
     return parser.parse_args()
 
 
@@ -371,8 +333,6 @@ def main() -> None:
     report = builder.build(
         object_ids=selected_ids,
         force=bool(args.force),
-        include_failed=bool(args.include_failed),
-        vis_collision=bool(args.vis_collision),
     )
 
     print(json.dumps(report, indent=2, ensure_ascii=False))

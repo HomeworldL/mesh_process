@@ -7,7 +7,6 @@ import shutil
 
 from .base import (
     CANONICAL_RAW_OBJ_NAME,
-    DEFAULT_MASS_KG,
     BaseIngestAdapter,
     DownloadReport,
     IngestConfig,
@@ -28,6 +27,7 @@ except Exception:  # pragma: no cover - tqdm optional
 class DGNAdapter(BaseIngestAdapter):
     source_name = "DGN"
     version = None
+    normalized_default_mass_kg = 10.0
 
     default_url = (
         "https://huggingface.co/datasets/JiayiChenPKU/BODex/resolve/main/"
@@ -84,7 +84,7 @@ class DGNAdapter(BaseIngestAdapter):
                 num_objects=0,
                 num_categories=0,
                 has_texture_policy="none",
-                default_mass_kg=DEFAULT_MASS_KG,
+                default_mass_kg=self.normalized_default_mass_kg,
             )
             return manifest
 
@@ -100,7 +100,7 @@ class DGNAdapter(BaseIngestAdapter):
                     category=None,
                     mesh_path=relative_to_repo(cfg.repo_root, mesh_path),
                     mesh_format="obj",
-                    mass_kg=DEFAULT_MASS_KG,
+                    mass_kg=self.normalized_default_mass_kg,
                     has_texture="false",
                     mtl_path=None,
                     texture_files=[],
@@ -111,7 +111,7 @@ class DGNAdapter(BaseIngestAdapter):
             num_objects=len(objects),
             num_categories=0,
             has_texture_policy="none",
-            default_mass_kg=DEFAULT_MASS_KG,
+            default_mass_kg=self.normalized_default_mass_kg,
         )
         return manifest
 

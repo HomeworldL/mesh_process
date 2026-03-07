@@ -117,7 +117,9 @@ Notes:
 - Google Drive downloads use `gdown` (`pip install gdown`).
 - Download stage uses `tqdm` progress bars (YCB stream download, archive extract, Objaverse batch mirror).
 - `organize` will build `assets/objects/processed/<dataset>/manifest.json` automatically.
-- `mass_kg` is included per object; when unknown, default value is `0.1`.
+- `mass_kg` is included per object; when unknown, default mass depends on dataset normalization policy:
+  - normalized object datasets (`ShapeNetCore`, `ShapeNetSem`, `DGN`, `DDG`): `10.0 kg`
+  - non-normalized datasets (`YCB`, `RealDex`, `GraspNet`, `HOPE`, `KIT`, `MSO`, `Objaverse`, `DexNet`): `0.1 kg`
 - Canonical organized file names are: `raw.obj`, optional `texture_map.png`, optional `textured.mtl`.
   - ShapeNetSem/ShapeNetCore default behavior is OBJ-only (`raw.obj` after normalization). Texture export is optional via env (`SHAPENET_EXPORT_TEXTURES=1` or source-specific switch).
 - ShapeNetCore / ShapeNetSem usually require terms acceptance and authenticated/manual archive retrieval.
@@ -178,11 +180,19 @@ Notes:
 - If textures exist, normalized outputs are `textured.mtl` + `texture_map.png`.
 - Adapter is integrated in the same Stage-1 flow as other completed datasets.
 
+### DGN / DDG
+
+- Source archive is organized by `DGNAdapter`; output includes:
+  - full set: `assets/objects/processed/DGN/`
+  - derived subset (`ddg*` prefix): `assets/objects/processed/DDG/`
+- These two datasets are treated as normalized object models for default mass policy (`10.0 kg` when source mass is unknown).
+
 ### ShapeNetCore / ShapeNetSem
 
 - Requires manual/authenticated archive acquisition.
 - Recommended flow: put archive under `assets/objects/raw/<dataset>/`, then run `download` + `organize`.
 - Organized output is normalized under `assets/objects/processed/<dataset>/`.
+- These datasets are treated as normalized object models for default mass policy (`10.0 kg` when source mass is unknown).
 - ShapeNetCore details:
   - `download`: selective extraction from `ShapeNetCore.v2.zip` using `filter_lists.py` (allowed synsets + denylist ids), only keeps `model_normalized.{obj,mtl,json}` and referenced `images/*`.
   - `organize`: load each OBJ then normalize geometry (AABB center -> origin, max extent -> `1.0`), drop abnormal meshes.

@@ -12,7 +12,6 @@ from .base import (
     CANONICAL_MTL_NAME,
     CANONICAL_RAW_OBJ_NAME,
     CANONICAL_TEXTURE_NAME,
-    DEFAULT_MASS_KG,
     BaseIngestAdapter,
     DownloadReport,
     IngestConfig,
@@ -27,6 +26,7 @@ class _ShapeNetHFBaseAdapter(BaseIngestAdapter):
     hf_repo_id: str = ""
     homepage: str = "https://huggingface.co/datasets/ShapeNet"
     required_files: list[str] = []
+    normalized_default_mass_kg: float = 10.0
 
     @staticmethod
     def _subset_filter(cfg: IngestConfig) -> set[str] | None:
@@ -433,7 +433,7 @@ class _ShapeNetHFBaseAdapter(BaseIngestAdapter):
                 num_objects=0,
                 num_categories=0,
                 has_texture_policy="unknown",
-                default_mass_kg=DEFAULT_MASS_KG,
+                default_mass_kg=self.normalized_default_mass_kg,
             )
             return manifest
 
@@ -469,7 +469,7 @@ class _ShapeNetHFBaseAdapter(BaseIngestAdapter):
                     category=category,
                     mesh_path=relative_to_repo(cfg.repo_root, mesh_path),
                     mesh_format="obj",
-                    mass_kg=DEFAULT_MASS_KG,
+                    mass_kg=self.normalized_default_mass_kg,
                     has_texture=has_texture,
                     mtl_path=(relative_to_repo(cfg.repo_root, mtl_path) if mtl_path.exists() else None),
                     texture_files=texture_files,
@@ -490,6 +490,6 @@ class _ShapeNetHFBaseAdapter(BaseIngestAdapter):
             num_objects=len(objects),
             num_categories=len(categories),
             has_texture_policy=texture_policy,
-            default_mass_kg=DEFAULT_MASS_KG,
+            default_mass_kg=self.normalized_default_mass_kg,
         )
         return manifest
