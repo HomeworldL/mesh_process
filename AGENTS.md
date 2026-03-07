@@ -62,9 +62,12 @@ Build `third_party/CoACD` and `third_party/ACVD` binaries before running `proces
   - convex export -> `meshes/coacd_convex_piece_*.obj`
   - `mesh_simplify` -> `simplified.obj` (default skip when exists)
   - `mesh_visual` -> `visual.obj` + optional visual material/texture compression outputs
-    - textured input is canonical single texture (`textured.mtl + texture_map.png`) and outputs single `visual_texture_map.*`
+    - textured input is canonical single texture (`textured.mtl + texture_map.png`) and outputs single `visual_texture_map.png`
     - visual geometry is decimated from `inertia.obj` (fallback to `raw.obj` only if `inertia.obj` is missing)
     - object is marked success only if generated `visual.obj` can be loaded as a non-empty scene with valid bounds
+  - inertia robustness:
+    - if trimesh returns negative-signed inertia (e.g., flipped winding / negative signed volume), Stage-2 flips sign and enforces a positive floor
+    - if inertia eigenvalues are still non-positive, fallback to AABB-based diagonal inertia (box approximation) to avoid zero `diaginertia` in MJCF/URDF
 - Default behavior:
   - step-level skip where outputs already exist
   - `--force` recomputes all steps
@@ -157,8 +160,8 @@ Build `third_party/CoACD` and `third_party/ACVD` binaries before running `proces
   1. run `ingest_assets.py` (`download -> organize -> verify`),
   2. run `process_meshes.py --dataset <source>`,
   3. run `build_object_descriptions.py --dataset <source>`.
-- Verify outputs per object: `inertia.obj`, `manifold.obj`, `meshes/*.obj`, `simplified.obj`, `visual.obj`, optional `visual.mtl`, optional `visual_texture_map.*`, `.urdf`, `.xml`.
-  - For textured objects, current expectation is single visual texture file (`visual_texture_map.*`).
+- Verify outputs per object: `inertia.obj`, `manifold.obj`, `meshes/*.obj`, `simplified.obj`, `visual.obj`, optional `visual.mtl`, optional `visual_texture_map.png`, `.urdf`, `.xml`.
+  - For textured objects, current expectation is single visual texture file (`visual_texture_map.png`).
 
 ## Manifest Format
 

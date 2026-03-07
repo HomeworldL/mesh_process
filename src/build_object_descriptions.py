@@ -25,6 +25,8 @@ from dataclasses import dataclass
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
+from PIL import Image
+
 
 @dataclass
 class ObjectSpec:
@@ -42,6 +44,24 @@ class ObjectDescriptionBuilder:
         self.dataset_root = dataset_root.resolve()
         self.urdf_base = ET.parse(str(urdf_prototype)).getroot()
         self.xml_base = ET.parse(str(xml_prototype)).getroot()
+
+    @staticmethod
+    def _ensure_png_texture(obj_dir: Path) -> str | None:
+        png_path = obj_dir / "visual_texture_map.png"
+        if png_path.exists():
+            return png_path.name
+
+        for legacy_name in ("visual_texture_map.jpg", "visual_texture_map.jpeg"):
+            legacy_path = obj_dir / legacy_name
+            if not legacy_path.exists():
+                continue
+            try:
+                with Image.open(legacy_path) as img:
+                    img.save(png_path, format="PNG", optimize=True, compress_level=9)
+                return png_path.name
+            except Exception:
+                return None
+        return None
 
     @staticmethod
     def _replace_xml_attributes(root: ET.Element, path: str, attrs: dict[str, str]) -> None:
@@ -109,12 +129,7 @@ class ObjectDescriptionBuilder:
                 warnings.append(f"skip {object_id}: non-numeric principal_moments={pm}")
                 continue
 
-            visual_texture_rel = None
-            for candidate in ["visual_texture_map.jpg", "visual_texture_map.png"]:
-                p = obj_dir / candidate
-                if p.exists():
-                    visual_texture_rel = candidate
-                    break
+            visual_texture_rel = self._ensure_png_texture(obj_dir)
 
             specs.append(
                 ObjectSpec(

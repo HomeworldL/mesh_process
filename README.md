@@ -207,12 +207,14 @@ python src/process_meshes.py --dataset YCB --workers 8
 Flow per object:
 - `mesh_transform` (always runs): regenerate `inertia.obj` and inertial principal data.
   - principal-axis assignment now selects signed/permuted axes that remain close to original XYZ orientation while still aligning to principal directions.
+  - for negative-signed inertia from flipped winding / negative signed volume, Stage-2 flips sign and enforces a positive inertia floor.
+  - if eigenvalues are still non-positive, Stage-2 falls back to AABB-based diagonal inertia (box approximation), avoiding zero `diaginertia` in exported MJCF/URDF.
 - `mesh_manifold_and_convex_decomp`: generate `manifold.obj` + `coacd.obj`.
 - convex export: write `meshes/coacd_convex_piece_*.obj`.
 - `mesh_simplify`: generate `simplified.obj` (skip if exists unless `--force`).
-- `mesh_visual`: generate compressed visual assets (`visual.obj`, optional `visual.mtl`, optional `visual_texture_map.*`) with geometry decimation + OBJ text slimming + texture compression.
+- `mesh_visual`: generate compressed visual assets (`visual.obj`, optional `visual.mtl`, optional `visual_texture_map.png`) with geometry decimation + OBJ text slimming + texture compression.
   - visual geometry is decimated from `inertia.obj` (fallback `raw.obj` if missing).
-  - Textured objects are treated as canonical single-texture input (`textured.mtl + texture_map.png`) and produce one `visual_texture_map.*`.
+  - Textured objects are treated as canonical single-texture input (`textured.mtl + texture_map.png`) and produce one `visual_texture_map.png`.
   - before marking an object as success, Stage-2 validates that `visual.obj` is loadable as a non-empty scene with valid bounds.
 
 Parallel and overwrite behavior:

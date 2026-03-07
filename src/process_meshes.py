@@ -313,8 +313,9 @@ def compute_principal(mesh, mass_override=None):
         mass = float(getattr(mesh, "mass", vol) or vol)
 
     try:
-        if vol > 0:
-            mesh.density = float(mass) / float(vol)
+        if abs(float(vol)) > 0:
+            # Some meshes have flipped winding and negative signed volume.
+            mesh.density = float(mass) / abs(float(vol))
         else:
             mesh.density = 1.0
     except Exception:
@@ -331,9 +332,26 @@ def compute_principal(mesh, mass_override=None):
         I = np.eye(3) * 1e-8
     I = 0.5 * (I + I.T)
 
+    if np.all(np.isfinite(I)) and float(np.trace(I)) < 0.0:
+        # Trimesh may return a fully negative inertia for negative-volume meshes.
+        I = -I
+
     w, v = np.linalg.eigh(I)
     w = np.real_if_close(w)
-    w[w < 0] = np.maximum(w[w >= 0].min() if np.any(w >= 0) else 0.0, 0.0)
+    if not np.any(w > 0):
+        # Stable physical fallback from AABB extents to avoid zero inertials in MJCF.
+        ext = np.asarray(mesh.bounds[1] - mesh.bounds[0], dtype=float)
+        ext = np.maximum(ext, 1e-6)
+        ixx = (float(mass) / 12.0) * float(ext[1] ** 2 + ext[2] ** 2)
+        iyy = (float(mass) / 12.0) * float(ext[0] ** 2 + ext[2] ** 2)
+        izz = (float(mass) / 12.0) * float(ext[0] ** 2 + ext[1] ** 2)
+        I = np.diag([ixx, iyy, izz])
+        w, v = np.linalg.eigh(I)
+        w = np.real_if_close(w)
+
+    min_pos = float(np.min(w[w > 0])) if np.any(w > 0) else 1e-12
+    floor = max(min_pos * 1e-6, 1e-12)
+    w[w < floor] = floor
 
     largest_idx = int(np.argmax(w))
     if largest_idx != 2:
@@ -601,7 +619,7 @@ def mesh_visual(obj_dir, args):
     """
     Build compressed visual assets for MuJoCo loading speed:
       inertia.obj (fallback raw.obj) -> visual.obj
-      textured.mtl/texture_map.png -> visual.mtl + visual_texture_map.(jpg|png)
+      textured.mtl/texture_map.png -> visual.mtl + visual_texture_map.png
     This function never overwrites raw.obj.
     """
     obj_dir = Path(obj_dir)
@@ -634,7 +652,8 @@ def mesh_visual(obj_dir, args):
         tex_name = "texture_map.png"
 
     # Step C: texture compression to one visual texture.
-    dst_tex_ext = ".jpg" if args.visual_texture_format == "jpg" else ".png"
+    # MuJoCo texture loading expects PNG in this project pipeline.
+    dst_tex_ext = ".png"
     texture_info = {"texture_mode": "none", "texture_path": None}
     produced_visual_textures = []
     remap = {}
@@ -804,12 +823,8 @@ def _visual_outputs_exist(obj_dir: Path) -> bool:
     # For textured objects visual.mtl + visual_texture_map* are expected.
     textured_mtl = obj_dir / "textured.mtl"
     if textured_mtl.exists():
-        visual_tex_files = []
-        for name in ("visual_texture_map.jpg", "visual_texture_map.png"):
-            p = obj_dir / name
-            if p.exists():
-                visual_tex_files.append(p)
-        has_visual_tex = any(p.stat().st_size > 0 for p in visual_tex_files)
+        visual_tex = obj_dir / "visual_texture_map.png"
+        has_visual_tex = visual_tex.exists() and visual_tex.stat().st_size > 0
         return visual_mtl.exists() and visual_mtl.stat().st_size > 0 and has_visual_tex
     # For non-textured objects only visual.obj is required.
     return True
@@ -968,9 +983,9 @@ def process_object(
             mesh_visual(obj_dir=str(obj_dir), args=argparse.Namespace(**process_cfg))
         visual_obj = obj_dir / "visual.obj"
         visual_mtl = obj_dir / "visual.mtl"
-        visual_tex = next(iter(sorted(obj_dir.glob("visual_texture_map*.jpg"))), None)
+        visual_tex = next(iter(sorted(obj_dir.glob("visual_texture_map*.png"))), None)
         if visual_tex is None:
-            visual_tex = next(iter(sorted(obj_dir.glob("visual_texture_map*.png"))), None)
+            visual_tex = next(iter(sorted(obj_dir.glob("visual_texture_map*.jpg"))), None)
         rec["visual_obj_path"] = str(visual_obj) if visual_obj.exists() else None
         rec["visual_mtl_path"] = str(visual_mtl) if visual_mtl.exists() else None
         rec["visual_texture_path"] = str(visual_tex) if visual_tex is not None else None
@@ -1276,9 +1291,9 @@ def parse_args():
     p.add_argument(
         "--visual-texture-format",
         type=str,
-        choices=["jpg", "png"],
-        default="jpg",
-        help="Preferred visual texture format.",
+        choices=["png"],
+        default="png",
+        help="Visual texture format (PNG only).",
     )
     p.add_argument(
         "--visual-jpeg-quality",
