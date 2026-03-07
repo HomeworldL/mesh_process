@@ -58,6 +58,7 @@ Build `third_party/CoACD` and `third_party/ACVD` binaries before running `proces
 - Per-object steps:
   - `mesh_transform` (always run) -> `inertia.obj` + principal inertia info
     - principal axes are assigned with signed/permuted matching so new XYZ remains as close as possible to original XYZ while still aligned to principal directions
+    - when raw mesh orientation is negative (negative signed volume / negative raw inertia trace), Stage-2 flips face winding and normals while writing `inertia.obj`
   - `mesh_manifold_and_convex_decomp` -> `manifold.obj`, `coacd.obj`
   - convex export -> `meshes/coacd_convex_piece_*.obj`
   - `mesh_simplify` -> `simplified.obj` (default skip when exists)

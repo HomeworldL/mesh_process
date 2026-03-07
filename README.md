@@ -207,6 +207,7 @@ python src/process_meshes.py --dataset YCB --workers 8
 Flow per object:
 - `mesh_transform` (always runs): regenerate `inertia.obj` and inertial principal data.
   - principal-axis assignment now selects signed/permuted axes that remain close to original XYZ orientation while still aligning to principal directions.
+  - when raw mesh has negative orientation (negative signed volume / negative raw inertia trace), Stage-2 flips face winding and normals while exporting `inertia.obj`.
   - for negative-signed inertia from flipped winding / negative signed volume, Stage-2 flips sign and enforces a positive inertia floor.
   - if eigenvalues are still non-positive, Stage-2 falls back to AABB-based diagonal inertia (box approximation), avoiding zero `diaginertia` in exported MJCF/URDF.
 - `mesh_manifold_and_convex_decomp`: generate `manifold.obj` + `coacd.obj`.

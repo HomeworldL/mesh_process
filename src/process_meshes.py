@@ -7,7 +7,7 @@ Pipeline per object:
   1) mesh_transform -> inertia.obj
   2) mesh_manifold_and_convex_decomp -> manifold.obj + coacd.obj + meshes/*.obj
   3) mesh_simplify -> simplified.obj
-  4) mesh_visual -> visual.obj + visual.mtl + visual_texture_map.(jpg|png)
+  4) mesh_visual -> visual.obj + visual.mtl + visual_texture_map.png
 
 All outputs are written in the same object folder as raw.obj.
 """
@@ -49,6 +49,7 @@ except Exception as e:  # pragma: no cover
 _re_v = re.compile(r"^(\s*)v\s+([-\d.eE+]+)\s+([-\d.eE+]+)\s+([-\d.eE+]+)(.*)$")
 _re_vn = re.compile(r"^(\s*)vn\s+([-\d.eE+]+)\s+([-\d.eE+]+)\s+([-\d.eE+]+)(.*)$")
 _re_vt = re.compile(r"^(\s*)vt\s+([-\d.eE+]+)\s+([-\d.eE+]+)(?:\s+([-\d.eE+]+))?(.*)$")
+_re_f = re.compile(r"^\s*f\s+")
 _re_mtllib = re.compile(r"^(\s*)mtllib\s+(.+)$", re.IGNORECASE)
 _re_usemtl = re.compile(r"^\s*usemtl\s+(.+)$", re.IGNORECASE)
 
@@ -244,10 +245,28 @@ def copy_and_patch_mtl(src_obj, dst_obj_dir):
     return mapping
 
 
-def transform_obj_text(src_obj, dst_obj, T, mtllib_map=None):
+def _flip_face_winding(line: str) -> str:
+    leading = re.match(r"^\s*", line).group(0)
+    stripped = line.strip()
+    body = stripped[2:].strip()
+    if not body:
+        return line
+    face_part, sep, comment = body.partition("#")
+    verts = face_part.split()
+    if len(verts) < 3:
+        return line
+    verts.reverse()
+    rebuilt = f"{leading}f {' '.join(verts)}"
+    if sep:
+        rebuilt += f" #{comment.rstrip()}"
+    return rebuilt.rstrip() + "\n"
+
+
+def transform_obj_text(src_obj, dst_obj, T, mtllib_map=None, flip_faces=False, flip_normals=False):
     """
     Transform 'v' and 'vn' lines of src_obj into dst_obj using 4x4 transform T.
     Update 'mtllib' lines according to mtllib_map (original->basename).
+    Optionally flip OBJ face winding and vertex normals.
     """
     R = T[:3, :3]
     try:
@@ -269,10 +288,15 @@ def transform_obj_text(src_obj, dst_obj, T, mtllib_map=None):
         if m2:
             leading, snx, sny, snz, rest = m2.groups()
             n = R @ np.array([float(snx), float(sny), float(snz)], dtype=float)
+            if flip_normals:
+                n = -n
             nn = np.linalg.norm(n)
             if nn > 0:
                 n = n / nn
             out_lines.append(f"{leading}vn {n[0]:.9f} {n[1]:.9f} {n[2]:.9f}{rest}\n")
+            continue
+        if flip_faces and _re_f.match(line):
+            out_lines.append(_flip_face_winding(line))
             continue
         m3 = _re_mtllib.match(line)
         if m3 and mtllib_map:
@@ -756,6 +780,31 @@ def mesh_transform(
         raise RuntimeError(f"Failed to load mesh {src_obj}: {e}")
 
     mass_value = float(mass_value)
+    signed_volume = None
+    trace_raw = None
+    try:
+        signed_volume = float(mesh.volume)
+        if not np.isfinite(signed_volume):
+            signed_volume = None
+    except Exception:
+        signed_volume = None
+    try:
+        trace_raw = float(np.trace(np.asarray(mesh.moment_inertia, dtype=float)))
+        if not np.isfinite(trace_raw):
+            trace_raw = None
+    except Exception:
+        trace_raw = None
+
+    # Repair negative orientation before principal inertia and inertia.obj export.
+    flip_faces = bool(
+        (signed_volume is not None and signed_volume < 0.0)
+        or (trace_raw is not None and trace_raw < 0.0)
+    )
+    if flip_faces:
+        try:
+            mesh.invert()
+        except Exception:
+            pass
 
     com, princ_w, princ_v, mass_used, vol, I = compute_principal(
         mesh, mass_override=mass_value
@@ -766,6 +815,7 @@ def mesh_transform(
         print(
             f"    princ_moments (ordered, largest->Z): {np.round(princ_w,9).tolist()}"
         )
+        print(f"    orientation_fix_applied={flip_faces}")
 
     align = build_alignment_T(com, princ_v, principal_moments=princ_w)
     T = align["T"]
@@ -776,7 +826,14 @@ def mesh_transform(
         print(f"    copied mtls/textures: {mtllib_map}")
 
     # write transformed obj
-    transform_obj_text(src_obj, dst_inertia_obj, T, mtllib_map)
+    transform_obj_text(
+        src_obj,
+        dst_inertia_obj,
+        T,
+        mtllib_map,
+        flip_faces=flip_faces,
+        flip_normals=flip_faces,
+    )
 
     return {
         "com": com.tolist(),
