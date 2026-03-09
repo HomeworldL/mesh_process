@@ -4,10 +4,11 @@ Stage-2 mesh processing for organized datasets under:
   assets/objects/processed/<dataset>/<object_id>/raw.obj
 
 Pipeline per object:
-  1) mesh_transform -> inertia.obj
-  2) mesh_manifold_and_convex_decomp -> manifold.obj + coacd.obj + meshes/*.obj
-  3) mesh_simplify -> simplified.obj
-  4) mesh_visual -> visual.obj + visual.mtl + visual_texture_map.png
+  1) mesh_make_manifold -> manifold.obj (must be watertight + volume)
+  2) principal-frame transform from manifold.obj (overwrite manifold.obj)
+  3) transform raw.obj with same transform -> visual.obj + visual.mtl + visual_texture_map.png
+  4) mesh_convex_decomp -> coacd.obj + meshes/*.obj
+  5) mesh_simplify -> simplified.obj
 
 All outputs are written in the same object folder as raw.obj.
 """
@@ -313,87 +314,17 @@ def transform_obj_text(src_obj, dst_obj, T, mtllib_map=None, flip_faces=False, f
 
 
 # -------------------------
-# Principal inertia computation (adapted)
+# Principal inertia frame alignment
 # -------------------------
-def compute_principal(mesh, mass_override=None):
-    """
-    Return com (3,), principal_moments (3,), principal_axes (3x3 columns),
-    mass (used), volume, and inertia matrix about COM.
-    """
-    if isinstance(mesh, trimesh.Scene):
-        geoms = [g for g in mesh.geometry.values()] if hasattr(mesh, "geometry") else []
-        if len(geoms) == 0:
-            raise RuntimeError("Scene has no geometry")
-        mesh = trimesh.util.concatenate(geoms)
-
-    vol = getattr(mesh, "volume", None)
-    if vol is None or not np.isfinite(vol) or vol == 0:
-        ext = mesh.bounds[1] - mesh.bounds[0]
-        vol = float(ext[0] * ext[1] * ext[2]) if np.all(ext > 0) else 1.0
-
-    if mass_override is not None:
-        mass = float(mass_override)
-    else:
-        mass = float(getattr(mesh, "mass", vol) or vol)
-
-    try:
-        if abs(float(vol)) > 0:
-            # Some meshes have flipped winding and negative signed volume.
-            mesh.density = float(mass) / abs(float(vol))
-        else:
-            mesh.density = 1.0
-    except Exception:
-        pass
-
-    try:
-        com = mesh.center_mass
-    except Exception:
-        com = mesh.centroid
-
-    try:
-        I = np.asarray(mesh.moment_inertia, dtype=float)
-    except Exception:
-        I = np.eye(3) * 1e-8
-    I = 0.5 * (I + I.T)
-
-    if np.all(np.isfinite(I)) and float(np.trace(I)) < 0.0:
-        # Trimesh may return a fully negative inertia for negative-volume meshes.
-        I = -I
-
-    w, v = np.linalg.eigh(I)
-    w = np.real_if_close(w)
-    if not np.any(w > 0):
-        # Stable physical fallback from AABB extents to avoid zero inertials in MJCF.
-        ext = np.asarray(mesh.bounds[1] - mesh.bounds[0], dtype=float)
-        ext = np.maximum(ext, 1e-6)
-        ixx = (float(mass) / 12.0) * float(ext[1] ** 2 + ext[2] ** 2)
-        iyy = (float(mass) / 12.0) * float(ext[0] ** 2 + ext[2] ** 2)
-        izz = (float(mass) / 12.0) * float(ext[0] ** 2 + ext[1] ** 2)
-        I = np.diag([ixx, iyy, izz])
-        w, v = np.linalg.eigh(I)
-        w = np.real_if_close(w)
-
-    min_pos = float(np.min(w[w > 0])) if np.any(w > 0) else 1e-12
-    floor = max(min_pos * 1e-6, 1e-12)
-    w[w < floor] = floor
-
-    largest_idx = int(np.argmax(w))
-    if largest_idx != 2:
-        others = [i for i in [0, 1, 2] if i != largest_idx]
-        new_order = others + [largest_idx]
-        w = w[new_order]
-        v = v[:, new_order]
-
-    if np.linalg.det(v) < 0:
-        v[:, -1] *= -1.0
-
-    return com, w, v, mass, vol, I
 
 
 def _best_aligned_principal_frame(principal_axes):
     """
     Choose signed/permuted principal axes that stay close to original XYZ.
     This preserves principal-axis alignment while avoiding abrupt axis relabeling.
+    Input `principal_axes` is expected to be a 3x3 matrix whose columns are
+    principal axes expressed in WORLD coordinates (principal->world basis vectors).
+    Returned `best_frame` keeps the same convention (principal->world).
     """
     base = np.asarray(principal_axes, dtype=float)
     best_frame = None
@@ -432,11 +363,30 @@ def _best_aligned_principal_frame(principal_axes):
 
 
 def build_alignment_T(com, principal_axes, principal_moments=None):
+    """
+    Build homogeneous transform between WORLD and aligned-principal frames.
+
+    Args:
+        com: center of mass in WORLD coordinates.
+        principal_axes: 3x3 axes matrix (principal->world; columns are principal
+            basis vectors expressed in WORLD coordinates).
+
+    Returns dict:
+        - `world_to_aligned_principal_T`: 4x4 transform WORLD->aligned-principal.
+        - `aligned_axes_principal_to_world`: 3x3 aligned axes (principal->world).
+        - `perm`: index permutation applied to principal moments.
+    """
     R, perm = _best_aligned_principal_frame(principal_axes)
     T = np.eye(4, dtype=float)
+    # R is principal->world, so world->principal rotation is R^T.
     T[:3, :3] = R.T
+    # x_principal = R^T * (x_world - com_world)
     T[:3, 3] = -R.T @ np.asarray(com, dtype=float)
-    out = {"T": T, "aligned_axes": R, "perm": perm}
+    out = {
+        "world_to_aligned_principal_T": T,
+        "aligned_axes_principal_to_world": R,
+        "perm": perm,
+    }
     if principal_moments is not None:
         w = np.asarray(principal_moments, dtype=float)
         out["aligned_moments"] = w[list(perm)].tolist()
@@ -446,19 +396,21 @@ def build_alignment_T(com, principal_axes, principal_moments=None):
 # -------------------------
 # External tool wrappers (CoACD / ACVD)
 # -------------------------
-def mesh_manifold_and_convex_decomp(
+def mesh_make_manifold(
     input_path,
     manifold_output_path,
-    coacd_output_path,
     quiet=False,
     timeout_sec=None,
 ):
+    manifold_output_path = Path(manifold_output_path)
+    tmp_coacd = manifold_output_path.parent / "coacd.manifold_only.tmp.obj"
+    tmp_coacd.unlink(missing_ok=True)
     cmd = [
         "third_party/CoACD/build/main",
         "-i",
         str(input_path),
         "-o",
-        str(coacd_output_path),
+        str(tmp_coacd),
         "-ro",
         str(manifold_output_path),
         "-pm",
@@ -471,9 +423,45 @@ def mesh_manifold_and_convex_decomp(
         run_kwargs["stderr"] = subprocess.DEVNULL
     try:
         proc = subprocess.run(cmd, timeout=timeout_sec, check=False, **run_kwargs)
-        return int(proc.returncode)
+        ret = int(proc.returncode)
     except subprocess.TimeoutExpired:
-        return 124
+        ret = 124
+    tmp_coacd.unlink(missing_ok=True)
+    return ret
+
+
+def mesh_convex_decomp(
+    input_path,
+    coacd_output_path,
+    quiet=False,
+    timeout_sec=None,
+):
+    coacd_output_path = Path(coacd_output_path)
+    tmp_manifold = coacd_output_path.parent / "manifold.convex_only.tmp.obj"
+    tmp_manifold.unlink(missing_ok=True)
+    cmd = [
+        "third_party/CoACD/build/main",
+        "-i",
+        str(input_path),
+        "-o",
+        str(coacd_output_path),
+        "-ro",
+        str(tmp_manifold),
+        "-pm",
+        "on",
+    ]
+    print("  [CoACD] running:", " ".join(cmd) if not quiet else "coacd (quiet mode)")
+    run_kwargs = {}
+    if quiet:
+        run_kwargs["stdout"] = subprocess.DEVNULL
+        run_kwargs["stderr"] = subprocess.DEVNULL
+    try:
+        proc = subprocess.run(cmd, timeout=timeout_sec, check=False, **run_kwargs)
+        ret = int(proc.returncode)
+    except subprocess.TimeoutExpired:
+        ret = 124
+    tmp_manifold.unlink(missing_ok=True)
+    return ret
 
 
 def mesh_simplify(input_path, output_path, vert_num=4000, gradation=0.5, quiet=False, timeout_sec=None):
@@ -639,19 +627,20 @@ def mesh_compress_texture(src_tex, dst_tex, max_size=1024, jpg_quality=85):
         return {"texture_mode": "png", "texture_path": dst_tex}
 
 
-def mesh_visual(obj_dir, args):
+def mesh_visual(obj_dir, args, src_obj: str | Path | None = None):
     """
     Build compressed visual assets for MuJoCo loading speed:
-      inertia.obj (fallback raw.obj) -> visual.obj
+      source OBJ (default raw.obj) -> visual.obj
       textured.mtl/texture_map.png -> visual.mtl + visual_texture_map.png
     This function never overwrites raw.obj.
     """
     obj_dir = Path(obj_dir)
-    src_obj = obj_dir / "inertia.obj"
-    if not src_obj.exists():
+    if src_obj is None:
         src_obj = obj_dir / "raw.obj"
+    else:
+        src_obj = Path(src_obj)
     if not src_obj.exists():
-        raise RuntimeError(f"inertia/raw obj missing: {src_obj}")
+        raise RuntimeError(f"source obj missing: {src_obj}")
 
     visual_obj = obj_dir / "visual.obj"
     tmp_decimated = obj_dir / "visual.decimated.tmp.obj"
@@ -756,16 +745,19 @@ def preview_obj(dst_obj):
         print("  Preview failed (likely headless):", e)
 
 
-def mesh_transform(
+def compute_principal_transform(
     src_obj,
-    dst_inertia_obj,
-    dst_inertia_dir,
     mass_value=0.1,
     verbose=False,
 ):
     """
-    Compute principal axes/com, write transformed .obj into dst_inertia_obj.
-    Copy/patch mtls & textures into dst_inertia_dir.
+    Compute principal-frame transform metadata from input OBJ.
+
+    Coordinate convention:
+    - `principal_inertia_transform` from trimesh is WORLD->PRINCIPAL.
+    - We extract principal axes in WORLD (principal->world), then apply our
+      signed/permuted alignment policy (still principal->world).
+    - Final returned transform is WORLD->ALIGNED_PRINCIPAL.
     """
     # load mesh using trimesh (no processing)
     try:
@@ -780,25 +772,51 @@ def mesh_transform(
         raise RuntimeError(f"Failed to load mesh {src_obj}: {e}")
 
     mass_value = float(mass_value)
-    signed_volume = None
-    trace_raw = None
     try:
-        signed_volume = float(mesh.volume)
-        if not np.isfinite(signed_volume):
-            signed_volume = None
+        vol = float(mesh.volume)
     except Exception:
-        signed_volume = None
-    try:
-        trace_raw = float(np.trace(np.asarray(mesh.moment_inertia, dtype=float)))
-        if not np.isfinite(trace_raw):
-            trace_raw = None
-    except Exception:
-        trace_raw = None
+        vol = np.nan
+    if not np.isfinite(vol) or abs(vol) <= 1e-18:
+        raise RuntimeError("invalid mesh volume for principal inertia computation")
+    # Keep inertia scale consistent with manifest mass.
+    mesh.density = float(mass_value) / abs(float(vol))
 
-    # Repair negative orientation before principal inertia and inertia.obj export.
+    try:
+        I_world = np.asarray(mesh.moment_inertia, dtype=float)
+    except Exception as e:
+        raise RuntimeError(f"failed to read moment_inertia: {e}") from e
+    I_world = 0.5 * (I_world + I_world.T)
+
+    try:
+        pit = np.asarray(mesh.principal_inertia_transform, dtype=float)
+    except Exception as e:
+        raise RuntimeError(f"failed to read principal_inertia_transform: {e}") from e
+    if pit.shape != (4, 4) or not np.all(np.isfinite(pit)):
+        raise RuntimeError("principal_inertia_transform is invalid")
+
+    try:
+        principal_components = np.asarray(mesh.principal_inertia_components, dtype=float)
+    except Exception as e:
+        raise RuntimeError(f"failed to read principal_inertia_components: {e}") from e
+    if principal_components.shape != (3,) or not np.all(np.isfinite(principal_components)):
+        raise RuntimeError("principal_inertia_components is invalid")
+
+    # Inertia tensor expressed in the principal frame (should be nearly diagonal).
+    try:
+        I_principal = np.asarray(mesh.moment_inertia_frame(pit), dtype=float)
+    except Exception as e:
+        raise RuntimeError(f"failed to compute moment_inertia_frame: {e}") from e
+    I_principal = 0.5 * (I_principal + I_principal.T)
+
+    try:
+        com = np.asarray(mesh.center_mass, dtype=float)
+    except Exception as e:
+        raise RuntimeError(f"failed to read center_mass: {e}") from e
+
+    # Repair negative orientation before principal inertia computation.
     flip_faces = bool(
-        (signed_volume is not None and signed_volume < 0.0)
-        or (trace_raw is not None and trace_raw < 0.0)
+        (np.isfinite(vol) and vol < 0.0)
+        or (np.isfinite(np.trace(I_world)) and float(np.trace(I_world)) < 0.0)
     )
     if flip_faces:
         try:
@@ -806,39 +824,33 @@ def mesh_transform(
         except Exception:
             pass
 
-    com, princ_w, princ_v, mass_used, vol, I = compute_principal(
-        mesh, mass_override=mass_value
+    # trimesh principal_inertia_transform is WORLD->PRINCIPAL.
+    R_world_to_principal = pit[:3, :3]
+    # Convert to principal->world axes matrix.
+    principal_axes_world = R_world_to_principal.T
+    align = build_alignment_T(
+        com,
+        principal_axes_world,
+        principal_moments=principal_components,
     )
+    world_to_aligned_principal_T = align["world_to_aligned_principal_T"]
+
     if verbose:
-        print(f"    volume={vol:.6g} mass_used={mass_used:.6g}")
+        print(f"    volume={vol:.6g} mass_used={mass_value:.6g}")
         print(f"    com={np.round(com,6).tolist()}")
         print(
-            f"    princ_moments (ordered, largest->Z): {np.round(princ_w,9).tolist()}"
+            f"    princ_moments (ordered, alignment-permuted): {np.round(np.asarray(align.get('aligned_moments', principal_components), dtype=float),9).tolist()}"
         )
+        print(f"    principal_inertia_transform_rotation_trace={float(np.trace(R_world_to_principal)):.6g}")
+        print(f"    moment_inertia_frame_diag={np.round(np.diag(I_principal),9).tolist()}")
         print(f"    orientation_fix_applied={flip_faces}")
 
-    align = build_alignment_T(com, princ_v, principal_moments=princ_w)
-    T = align["T"]
-
-    # copy and patch mtl/textures into dst_inertia_dir
-    mtllib_map = copy_and_patch_mtl(src_obj, dst_inertia_dir)
-    if verbose and mtllib_map:
-        print(f"    copied mtls/textures: {mtllib_map}")
-
-    # write transformed obj
-    transform_obj_text(
-        src_obj,
-        dst_inertia_obj,
-        T,
-        mtllib_map,
-        flip_faces=flip_faces,
-        flip_normals=flip_faces,
-    )
-
     return {
-        "com": com.tolist(),
-        "princ_w": align.get("aligned_moments", princ_w.tolist()),
-        "princ_v": align["aligned_axes"].tolist(),
+        "world_to_aligned_principal_T": world_to_aligned_principal_T.tolist(),
+        "flip_faces": bool(flip_faces),
+        "center_of_mass_world": com.tolist(),
+        "principal_moments_aligned": align.get("aligned_moments", principal_components.tolist()),
+        "principal_axes_principal_to_world_aligned": align["aligned_axes_principal_to_world"].tolist(),
     }
 
 
@@ -887,6 +899,33 @@ def _visual_outputs_exist(obj_dir: Path) -> bool:
     return True
 
 
+def validate_manifold_mesh(manifold_obj: Path) -> tuple[bool, str | None]:
+    if (not manifold_obj.exists()) or manifold_obj.stat().st_size <= 0:
+        return False, f"manifold.obj missing or empty: {manifold_obj}"
+    try:
+        loaded = trimesh.load(str(manifold_obj), process=False)
+    except Exception as e:
+        return False, f"failed to load manifold.obj: {e}"
+    if isinstance(loaded, trimesh.Scene):
+        geoms = [g for g in loaded.geometry.values()] if hasattr(loaded, "geometry") else []
+        if not geoms:
+            return False, "manifold.obj loaded as empty scene"
+        mesh = trimesh.util.concatenate(geoms)
+    else:
+        mesh = loaded
+    try:
+        if not bool(mesh.is_watertight):
+            return False, "manifold.obj is not watertight"
+    except Exception as e:
+        return False, f"failed to evaluate watertight: {e}"
+    try:
+        if not bool(mesh.is_volume):
+            return False, "manifold.obj is not volume"
+    except Exception as e:
+        return False, f"failed to evaluate is_volume: {e}"
+    return True, None
+
+
 def validate_visual_obj_loadable(obj_dir: Path) -> tuple[bool, str | None]:
     visual_obj = obj_dir / "visual.obj"
     if (not visual_obj.exists()) or visual_obj.stat().st_size <= 0:
@@ -920,10 +959,11 @@ def process_object(
 ) -> dict:
     print(f"[{idx}/{total}] {object_id}")
     src_obj = obj_dir / "raw.obj"
-    dst_inertia_obj = obj_dir / "inertia.obj"
     dst_manifold_obj = obj_dir / "manifold.obj"
     dst_coacd_obj = obj_dir / "coacd.obj"
     dst_simplified_obj = obj_dir / "simplified.obj"
+    tmp_raw_aligned_obj = obj_dir / "raw.aligned.tmp.obj"
+    tmp_manifold_aligned_obj = obj_dir / "manifold.aligned.tmp.obj"
     meshes_dir = obj_dir / "meshes"
     ensure_dir(str(meshes_dir))
 
@@ -943,50 +983,117 @@ def process_object(
         print(f"    ERROR: {rec['error']}")
         return rec
 
-    # Step 1: inertia transform
+    # Step 1: manifold from raw + topology/volume validation
     try:
-        print("  running mesh_transform...")
-        info = mesh_transform(
-            str(src_obj),
-            str(dst_inertia_obj),
-            str(obj_dir),
+        need_manifold = bool(process_cfg["force"]) or (not dst_manifold_obj.exists())
+        if need_manifold:
+            print("  running mesh_make_manifold...")
+            ret = mesh_make_manifold(
+                str(src_obj),
+                str(dst_manifold_obj),
+                quiet=bool(process_cfg["coacd_quiet"]),
+                timeout_sec=float(process_cfg["coacd_timeout_sec"]) if process_cfg["coacd_timeout_sec"] else None,
+            )
+            if ret != 0 or (not dst_manifold_obj.exists()):
+                raise RuntimeError(f"CoACD manifold failed (ret={ret})")
+        else:
+            print("  manifold exists -> skip generation")
+        ok, reason = validate_manifold_mesh(dst_manifold_obj)
+        if not ok:
+            raise RuntimeError(f"invalid manifold: {reason}")
+    except Exception as e:
+        rec["error"] = f"manifold failed: {e}"
+        print(f"    ERROR: {rec['error']}")
+        return rec
+
+    # Step 2: principal-frame transform from manifold, overwrite manifold.obj
+    try:
+        print("  computing principal frame from manifold...")
+        info = compute_principal_transform(
+            str(dst_manifold_obj),
             mass_value=mass_value,
             verbose=bool(process_cfg["verbose"]),
         )
-        rec["center_of_mass"] = info["com"]
-        rec["principal_moments"] = info["princ_w"]
-        rec["principal_axes"] = info["princ_v"]
+        rec["center_of_mass"] = info["center_of_mass_world"]
+        rec["principal_moments"] = info["principal_moments_aligned"]
+        rec["principal_axes"] = info["principal_axes_principal_to_world_aligned"]
+        world_to_aligned_principal_T = np.asarray(
+            info["world_to_aligned_principal_T"], dtype=float
+        )
+        flip_faces = bool(info["flip_faces"])
+        transform_obj_text(
+            str(dst_manifold_obj),
+            str(tmp_manifold_aligned_obj),
+            world_to_aligned_principal_T,
+            mtllib_map=None,
+            flip_faces=flip_faces,
+            flip_normals=flip_faces,
+        )
+        os.replace(str(tmp_manifold_aligned_obj), str(dst_manifold_obj))
+        ok, reason = validate_manifold_mesh(dst_manifold_obj)
+        if not ok:
+            raise RuntimeError(f"transformed manifold invalid: {reason}")
         if bool(process_cfg["preview"]):
-            preview_obj(str(dst_inertia_obj))
+            preview_obj(str(dst_manifold_obj))
     except Exception as e:
         rec["error"] = f"inertia failed: {e}"
         print(f"    ERROR: {rec['error']}")
         return rec
+    finally:
+        tmp_manifold_aligned_obj.unlink(missing_ok=True)
 
-    # Step 2: manifold + convex decomposition (CoACD)
+    # Step 3: build visual.obj from transformed raw.obj.
     try:
-        need_coacd = bool(process_cfg["force"]) or (not dst_manifold_obj.exists()) or (not dst_coacd_obj.exists())
+        if _visual_outputs_exist(obj_dir) and not bool(process_cfg["force"]):
+            print("  visual outputs exist -> skip")
+        else:
+            print("  transforming raw.obj and running mesh_visual...")
+            transform_obj_text(
+                str(src_obj),
+                str(tmp_raw_aligned_obj),
+                world_to_aligned_principal_T,
+                mtllib_map=None,
+                flip_faces=flip_faces,
+                flip_normals=flip_faces,
+            )
+            mesh_visual(
+                obj_dir=str(obj_dir),
+                args=argparse.Namespace(**process_cfg),
+                src_obj=str(tmp_raw_aligned_obj),
+            )
+        visual_obj = obj_dir / "visual.obj"
+        visual_mtl = obj_dir / "visual.mtl"
+        visual_tex = next(iter(sorted(obj_dir.glob("visual_texture_map*.png"))), None)
+        if visual_tex is None:
+            visual_tex = next(iter(sorted(obj_dir.glob("visual_texture_map*.jpg"))), None)
+        rec["visual_obj_path"] = str(visual_obj) if visual_obj.exists() else None
+        rec["visual_mtl_path"] = str(visual_mtl) if visual_mtl.exists() else None
+        rec["visual_texture_path"] = str(visual_tex) if visual_tex is not None else None
+        ok, reason = validate_visual_obj_loadable(obj_dir)
+        if not ok:
+            raise RuntimeError(f"visual validation failed: {reason}")
+    except Exception as e:
+        rec["error"] = f"visual mesh failed: {e}"
+        print(f"    ERROR: {rec['error']}")
+        return rec
+    finally:
+        tmp_raw_aligned_obj.unlink(missing_ok=True)
+
+    # Step 4: convex decomposition from transformed manifold
+    try:
+        need_coacd = bool(process_cfg["force"]) or (not dst_coacd_obj.exists())
         if need_coacd:
-            print("  running mesh_manifold_and_convex_decomp...")
-            in_for_coacd = str(dst_inertia_obj if dst_inertia_obj.exists() else src_obj)
-            ret = mesh_manifold_and_convex_decomp(
-                in_for_coacd,
+            print("  running mesh_convex_decomp...")
+            ret = mesh_convex_decomp(
                 str(dst_manifold_obj),
                 str(dst_coacd_obj),
                 quiet=bool(process_cfg["coacd_quiet"]),
                 timeout_sec=float(process_cfg["coacd_timeout_sec"]) if process_cfg["coacd_timeout_sec"] else None,
             )
             if ret != 0 or (not dst_coacd_obj.exists()):
-                raise RuntimeError(f"CoACD failed (ret={ret})")
+                raise RuntimeError(f"CoACD convex decomposition failed (ret={ret})")
         else:
-            print("  manifold/coacd exists -> skip")
-    except Exception as e:
-        rec["error"] = str(e)
-        print(f"    ERROR: {rec['error']}")
-        return rec
-
-    # Step 3: export convex pieces
-    try:
+            print("  coacd exists -> skip")
         need_convex_export = bool(process_cfg["force"]) or (not _convex_pieces_exist(meshes_dir))
         if need_convex_export:
             print("  exporting convex pieces...")
@@ -1005,19 +1112,14 @@ def process_object(
         print(f"    ERROR: {rec['error']}")
         return rec
 
-    # Step 4: simplify (ACVD)
+    # Step 5: simplify (ACVD)
     try:
         if dst_simplified_obj.exists() and not bool(process_cfg["force"]):
             print("  simplified exists -> skip")
         else:
             print("  running mesh_simplify...")
-            in_for_acvd = str(
-                dst_manifold_obj
-                if dst_manifold_obj.exists()
-                else (dst_inertia_obj if dst_inertia_obj.exists() else src_obj)
-            )
             ret = mesh_simplify(
-                in_for_acvd,
+                str(dst_manifold_obj),
                 str(dst_simplified_obj),
                 vert_num=int(process_cfg["acvd_vertnum"]),
                 gradation=float(process_cfg["acvd_gradation"]),
@@ -1028,29 +1130,6 @@ def process_object(
                 raise RuntimeError(f"ACVD failed (ret={ret}); simplified.obj missing")
     except Exception as e:
         rec["error"] = f"ACVD failed: {e}"
-        print(f"    ERROR: {rec['error']}")
-        return rec
-
-    # Step 5: visual compression mesh
-    try:
-        if _visual_outputs_exist(obj_dir) and not bool(process_cfg["force"]):
-            print("  visual outputs exist -> skip")
-        else:
-            print("  running mesh_visual...")
-            mesh_visual(obj_dir=str(obj_dir), args=argparse.Namespace(**process_cfg))
-        visual_obj = obj_dir / "visual.obj"
-        visual_mtl = obj_dir / "visual.mtl"
-        visual_tex = next(iter(sorted(obj_dir.glob("visual_texture_map*.png"))), None)
-        if visual_tex is None:
-            visual_tex = next(iter(sorted(obj_dir.glob("visual_texture_map*.jpg"))), None)
-        rec["visual_obj_path"] = str(visual_obj) if visual_obj.exists() else None
-        rec["visual_mtl_path"] = str(visual_mtl) if visual_mtl.exists() else None
-        rec["visual_texture_path"] = str(visual_tex) if visual_tex is not None else None
-        ok, reason = validate_visual_obj_loadable(obj_dir)
-        if not ok:
-            raise RuntimeError(f"visual validation failed: {reason}")
-    except Exception as e:
-        rec["error"] = f"visual mesh failed: {e}"
         print(f"    ERROR: {rec['error']}")
         return rec
 
@@ -1292,7 +1371,7 @@ def parse_args():
     p.add_argument(
         "--preview",
         action="store_true",
-        help="Show trimesh preview for inertia step (requires GUI)",
+        help="Show trimesh preview after manifold principal-frame transform (requires GUI)",
     )
     p.add_argument("--verbose", action="store_true", help="Verbose output")
     p.add_argument(
@@ -1331,7 +1410,7 @@ def parse_args():
         "--visual-target-faces",
         type=int,
         default=20000,
-        help="Visual mesh decimation target face count (from inertia.obj, fallback raw.obj).",
+        help="Visual mesh decimation target face count.",
     )
     p.add_argument(
         "--visual-obj-decimals",

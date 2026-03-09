@@ -61,8 +61,9 @@ class ObjectDescriptionBuilder:
                 return p.parent
         return dataset_root / object_id
 
-    def _collect_specs(self, manifest: dict, selected_ids: set[str] | None) -> list[ObjectSpec]:
+    def _collect_specs(self, manifest: dict, selected_ids: set[str] | None) -> tuple[list[ObjectSpec], int]:
         specs: list[ObjectSpec] = []
+        skipped_non_success = 0
 
         objects = manifest.get("objects", [])
         if not isinstance(objects, list):
@@ -79,7 +80,8 @@ class ObjectDescriptionBuilder:
 
             status = rec.get("process_status")
             if status != "success":
-                raise RuntimeError(f"{object_id}: process_status={status}, expected success")
+                skipped_non_success += 1
+                continue
 
             obj_dir = self._find_mesh_path_from_record(self.dataset_root, object_id, rec)
             visual_abs = obj_dir / "visual.obj"
@@ -125,7 +127,7 @@ class ObjectDescriptionBuilder:
                 )
             )
 
-        return specs
+        return specs, skipped_non_success
 
     def _update_urdf(self, spec: ObjectSpec) -> ET.Element:
         new_urdf = copy.deepcopy(self.urdf_base)
@@ -267,7 +269,7 @@ class ObjectDescriptionBuilder:
         with open(manifest_path, "r", encoding="utf-8") as f:
             manifest = json.load(f)
 
-        specs = self._collect_specs(
+        specs, skipped_non_success = self._collect_specs(
             manifest=manifest,
             selected_ids=object_ids,
         )
@@ -293,7 +295,7 @@ class ObjectDescriptionBuilder:
             "num_candidates": len(specs),
             "num_built": built,
             "num_skipped": skipped,
-            "num_failed": 0,
+            "num_failed": skipped_non_success,
         }
 
 

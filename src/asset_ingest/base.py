@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 import argparse
 import os
 import re
@@ -260,12 +260,20 @@ def copy_file_with_progress(src_path: Path, dst_path: Path, desc: str | None = N
         pbar.close()
 
 
-def extract_zip(zip_path: Path, output_dir: Path, force: bool = False, show_progress: bool = True) -> Path:
+def extract_zip(
+    zip_path: Path,
+    output_dir: Path,
+    force: bool = False,
+    show_progress: bool = True,
+    skip_member: Callable[[str], bool] | None = None,
+) -> Path:
     if output_dir.exists() and force:
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path, "r") as zf:
         members = zf.infolist()
+        if skip_member is not None:
+            members = [m for m in members if not skip_member(m.filename)]
         bar = None
         if show_progress and tqdm is not None:
             bar = tqdm(members, desc=f"extract {zip_path.name}", unit="file")

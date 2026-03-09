@@ -4,13 +4,13 @@
 
 - `src/`: main code.
   - `ingest_assets.py`: Stage-1 CLI (`download/organize/verify`) for object sources.
-  - `visualize_obj.py`: utility to preview one OBJ from `processed/<source>` (random by default, or specify object id, supports raw/inertia/visual).
+  - `visualize_obj.py`: utility to preview one OBJ from `processed/<source>` (random by default, or specify object id, supports raw/manifold/visual).
   - `visualize_obj_mujcoco.py`: utility to preview one built MJCF (`.xml`) in MuJoCo viewer.
   - `asset_ingest/`: source adapters and manifest schema.
     - `base.py`: abstract adapter interface.
     - `manifest.py`: manifest dataclass + validation.
     - source adapters: `ycb.py`, `realdex.py`, `graspnet.py`, `hope.py`, `kit.py`, `mso.py`, `objaverse.py`, etc.
-  - `process_meshes.py`: Stage-2 mesh processing (`raw -> inertia -> manifold/coacd -> simplified -> visual`).
+  - `process_meshes.py`: Stage-2 mesh processing (`raw -> manifold -> inertia-frame transform -> visual/coacd/simplified`).
   - `build_object_descriptions.py`: Stage-3 URDF/MJCF generation.
   - `download_*.py`, `organize_*.py`: legacy or source-specific helper scripts.
   - `utils/`: reusable utilities (`util_file.py` etc.).
@@ -52,26 +52,28 @@
 - Stage-2 process: `python src/process_meshes.py --dataset YCB --workers 8`
 - Stage-3 export: `python src/build_object_descriptions.py --dataset YCB --force`
 - Quick mesh preview: `python src/visualize_obj.py --dataset YCB`
-  - mesh selection: `--mesh-type raw|inertia|visual`
+  - mesh selection: `--mesh-type raw|manifold|visual`
 Build `third_party/CoACD` and `third_party/ACVD` binaries before running `process_meshes.py`.
 
 ## Stage-2 Process Flow (`process_meshes.py`)
 
 - Input: `assets/objects/processed/<dataset>/<object_id>/raw.obj`
 - Per-object steps:
-  - `mesh_transform` (always run) -> `inertia.obj` + principal inertia info
+  - `mesh_make_manifold` (CoACD remesh) -> `manifold.obj`
+    - if generation fails, object is failed
+    - `manifold.obj` must satisfy `trimesh.is_watertight=True` and `trimesh.is_volume=True`, otherwise object is failed
+  - principal inertia computation is performed on `manifold.obj` (not on raw)
+    - inertia computation directly uses trimesh built-ins: `moment_inertia`, `moment_inertia_frame`, `principal_inertia_components`, `principal_inertia_transform`
     - principal axes are assigned with signed/permuted matching so new XYZ remains as close as possible to original XYZ while still aligned to principal directions
-    - when raw mesh orientation is negative (negative signed volume / negative raw inertia trace), Stage-2 flips face winding and normals while writing `inertia.obj`
-  - `mesh_manifold_and_convex_decomp` -> `manifold.obj`, `coacd.obj`
+    - transformed manifold overwrites `manifold.obj` in principal-inertia frame
+  - raw mesh is transformed by the same principal-frame transform, then directly compressed to `visual.obj` (no `inertia.obj` output is kept)
+  - `mesh_convex_decomp` -> `coacd.obj`
   - convex export -> `meshes/coacd_convex_piece_*.obj`
   - `mesh_simplify` -> `simplified.obj` (default skip when exists)
   - `mesh_visual` -> `visual.obj` + optional visual material/texture compression outputs
     - textured input is canonical single texture (`textured.mtl + texture_map.png`) and outputs single `visual_texture_map.png`
-    - visual geometry is decimated from `inertia.obj` (fallback to `raw.obj` only if `inertia.obj` is missing)
+    - visual geometry is decimated from transformed `raw.obj` (temporary file)
     - object is marked success only if generated `visual.obj` can be loaded as a non-empty scene with valid bounds
-  - inertia robustness:
-    - if trimesh returns negative-signed inertia (e.g., flipped winding / negative signed volume), Stage-2 flips sign and enforces a positive floor
-    - if inertia eigenvalues are still non-positive, fallback to AABB-based diagonal inertia (box approximation) to avoid zero `diaginertia` in MJCF/URDF
 - Default behavior:
   - step-level skip where outputs already exist
   - `--force` recomputes all steps
@@ -166,7 +168,7 @@ Build `third_party/CoACD` and `third_party/ACVD` binaries before running `proces
   1. run `ingest_assets.py` (`download -> organize -> verify`),
   2. run `process_meshes.py --dataset <source>`,
   3. run `build_object_descriptions.py --dataset <source>`.
-- Verify outputs per object: `inertia.obj`, `manifold.obj`, `meshes/*.obj`, `simplified.obj`, `visual.obj`, optional `visual.mtl`, optional `visual_texture_map.png`, `.urdf`, `.xml`.
+- Verify outputs per object: `manifold.obj`, `coacd.obj`, `meshes/*.obj`, `simplified.obj`, `visual.obj`, optional `visual.mtl`, optional `visual_texture_map.png`, `.urdf`, `.xml`.
   - For textured objects, current expectation is single visual texture file (`visual_texture_map.png`).
 
 ## Manifest Format

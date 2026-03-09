@@ -23,7 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--mesh-type",
         type=str,
-        choices=["raw", "inertia", "visual"],
+        choices=["raw", "manifold", "visual"],
         default="raw",
         help="Choose which canonical mesh to display.",
     )
@@ -51,8 +51,8 @@ def main() -> None:
 
     if args.mesh_type == "raw":
         target_name = "raw.obj"
-    elif args.mesh_type == "inertia":
-        target_name = "inertia.obj"
+    elif args.mesh_type == "manifold":
+        target_name = "manifold.obj"
     else:
         target_name = "visual.obj"
 

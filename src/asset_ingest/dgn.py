@@ -36,6 +36,15 @@ class DGNAdapter(BaseIngestAdapter):
     archive_name = "DGN_obj_raw.zip"
     extract_dirname = "DGN_obj_raw"
 
+    @staticmethod
+    def _skip_zip_member(member_name: str) -> bool:
+        normalized = member_name.replace("\\", "/")
+        parts = [p for p in normalized.split("/") if p]
+        if any(p == "__MACOSX" for p in parts):
+            return True
+        basename = parts[-1] if parts else normalized
+        return basename.startswith("._")
+
     @classmethod
     def _resolve_extract_root(cls, source_download_dir: Path) -> Path:
         root = source_download_dir / cls.extract_dirname
@@ -64,7 +73,13 @@ class DGNAdapter(BaseIngestAdapter):
 
         extract_dir = out_dir / self.extract_dirname
         if not extract_dir.exists() or cfg.force:
-            extract_zip(archive_path, extract_dir, force=cfg.force, show_progress=True)
+            extract_zip(
+                archive_path,
+                extract_dir,
+                force=cfg.force,
+                show_progress=True,
+                skip_member=self._skip_zip_member,
+            )
             report.notes.append(f"extracted: {relative_to_repo(cfg.repo_root, extract_dir)}")
         else:
             report.notes.append(f"skip existing extract dir: {relative_to_repo(cfg.repo_root, extract_dir)}")
@@ -152,7 +167,8 @@ class DGNAdapter(BaseIngestAdapter):
                 continue
 
             # 1) Always keep full DGN set.
-            base_id_dgn = sanitize_object_id(f"DGN_{raw_name}")
+            # Keep source naming (sanitized) for DGN object ids; do not add extra prefix.
+            base_id_dgn = raw_name
             object_id_dgn = base_id_dgn
             suffix = 1
             while object_id_dgn in seen_dgn:

@@ -53,11 +53,11 @@ Optional:
 ```bash
 python src/visualize_obj.py --dataset RealDex --seed 42
 python src/visualize_obj.py --dataset YCB --mesh-type visual
-python src/visualize_obj.py --dataset YCB --mesh-type inertia
+python src/visualize_obj.py --dataset YCB --mesh-type manifold
 ```
 
 Notes:
-- `--mesh-type raw|inertia|visual` chooses `raw.obj` / `inertia.obj` / `visual.obj`.
+- `--mesh-type raw|manifold|visual` chooses `raw.obj` / `manifold.obj` / `visual.obj`.
 - If `--object-id` is provided, it visualizes exactly that object folder.
 
 MuJoCo MJCF visualization:
@@ -208,6 +208,8 @@ Notes:
 
 ## Stage 2: Process Meshes (`process_meshes.py`)
 
+Refactor note: see `docs/stage2_manifold_first_refactor.md` for this manifold-first redesign and compatibility details.
+
 Run Stage-2 on organized objects:
 
 ```bash
@@ -215,18 +217,19 @@ python src/process_meshes.py --dataset YCB --workers 8
 ```
 
 Flow per object:
-- `mesh_transform` (always runs): regenerate `inertia.obj` and inertial principal data.
-  - principal-axis assignment now selects signed/permuted axes that remain close to original XYZ orientation while still aligning to principal directions.
-  - when raw mesh has negative orientation (negative signed volume / negative raw inertia trace), Stage-2 flips face winding and normals while exporting `inertia.obj`.
-  - for negative-signed inertia from flipped winding / negative signed volume, Stage-2 flips sign and enforces a positive inertia floor.
-  - if eigenvalues are still non-positive, Stage-2 falls back to AABB-based diagonal inertia (box approximation), avoiding zero `diaginertia` in exported MJCF/URDF.
-- `mesh_manifold_and_convex_decomp`: generate `manifold.obj` + `coacd.obj`.
-- convex export: write `meshes/coacd_convex_piece_*.obj`.
-- `mesh_simplify`: generate `simplified.obj` (skip if exists unless `--force`).
-- `mesh_visual`: generate compressed visual assets (`visual.obj`, optional `visual.mtl`, optional `visual_texture_map.png`) with geometry decimation + OBJ text slimming + texture compression.
-  - visual geometry is decimated from `inertia.obj` (fallback `raw.obj` if missing).
+- `mesh_make_manifold`: generate `manifold.obj` from `raw.obj` using CoACD remesh output.
+  - object fails immediately if CoACD remesh fails.
+  - Stage-2 requires `manifold.obj` to satisfy `is_watertight=True` and `is_volume=True`; otherwise object fails.
+- principal-frame inertia step runs on `manifold.obj` (not on `raw.obj`):
+  - inertia computation now directly uses trimesh built-ins: `moment_inertia`, `moment_inertia_frame`, `principal_inertia_components`, `principal_inertia_transform`.
+  - principal-axis assignment selects signed/permuted axes that remain close to original XYZ orientation while still aligning to principal directions.
+  - transformed manifold overwrites `manifold.obj` in the principal frame.
+- raw mesh is transformed by the same principal-frame transform and directly compressed to visual assets (`visual.obj`, optional `visual.mtl`, optional `visual_texture_map.png`); `inertia.obj` is no longer generated.
   - Textured objects are treated as canonical single-texture input (`textured.mtl + texture_map.png`) and produce one `visual_texture_map.png`.
   - before marking an object as success, Stage-2 validates that `visual.obj` is loadable as a non-empty scene with valid bounds.
+- `mesh_convex_decomp`: run CoACD convex decomposition from transformed `manifold.obj` to `coacd.obj`.
+- convex export: write `meshes/coacd_convex_piece_*.obj`.
+- `mesh_simplify`: generate `simplified.obj` from transformed `manifold.obj` (skip if exists unless `--force`).
 
 Parallel and overwrite behavior:
 - Default is step-level skip where applicable.
