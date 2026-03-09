@@ -4,10 +4,10 @@ Stage-2 mesh processing for organized datasets under:
   assets/objects/processed/<dataset>/<object_id>/raw.obj
 
 Pipeline per object:
-  1) mesh_make_manifold -> manifold.obj (must be watertight + volume)
+  1) mesh_manifold_and_convex_decomp -> manifold.obj + coacd.obj
   2) principal-frame transform from manifold.obj (overwrite manifold.obj)
   3) transform raw.obj with same transform -> visual.obj + visual.mtl + visual_texture_map.png
-  4) mesh_convex_decomp -> coacd.obj + meshes/*.obj
+  4) transform coacd.obj with same transform -> meshes/*.obj
   5) mesh_simplify -> simplified.obj
 
 All outputs are written in the same object folder as raw.obj.
@@ -396,21 +396,19 @@ def build_alignment_T(com, principal_axes, principal_moments=None):
 # -------------------------
 # External tool wrappers (CoACD / ACVD)
 # -------------------------
-def mesh_make_manifold(
+def mesh_manifold_and_convex_decomp(
     input_path,
     manifold_output_path,
+    coacd_output_path,
     quiet=False,
     timeout_sec=None,
 ):
-    manifold_output_path = Path(manifold_output_path)
-    tmp_coacd = manifold_output_path.parent / "coacd.manifold_only.tmp.obj"
-    tmp_coacd.unlink(missing_ok=True)
     cmd = [
         "third_party/CoACD/build/main",
         "-i",
         str(input_path),
         "-o",
-        str(tmp_coacd),
+        str(coacd_output_path),
         "-ro",
         str(manifold_output_path),
         "-pm",
@@ -426,41 +424,6 @@ def mesh_make_manifold(
         ret = int(proc.returncode)
     except subprocess.TimeoutExpired:
         ret = 124
-    tmp_coacd.unlink(missing_ok=True)
-    return ret
-
-
-def mesh_convex_decomp(
-    input_path,
-    coacd_output_path,
-    quiet=False,
-    timeout_sec=None,
-):
-    coacd_output_path = Path(coacd_output_path)
-    tmp_manifold = coacd_output_path.parent / "manifold.convex_only.tmp.obj"
-    tmp_manifold.unlink(missing_ok=True)
-    cmd = [
-        "third_party/CoACD/build/main",
-        "-i",
-        str(input_path),
-        "-o",
-        str(coacd_output_path),
-        "-ro",
-        str(tmp_manifold),
-        "-pm",
-        "on",
-    ]
-    print("  [CoACD] running:", " ".join(cmd) if not quiet else "coacd (quiet mode)")
-    run_kwargs = {}
-    if quiet:
-        run_kwargs["stdout"] = subprocess.DEVNULL
-        run_kwargs["stderr"] = subprocess.DEVNULL
-    try:
-        proc = subprocess.run(cmd, timeout=timeout_sec, check=False, **run_kwargs)
-        ret = int(proc.returncode)
-    except subprocess.TimeoutExpired:
-        ret = 124
-    tmp_manifold.unlink(missing_ok=True)
     return ret
 
 
@@ -964,6 +927,7 @@ def process_object(
     dst_simplified_obj = obj_dir / "simplified.obj"
     tmp_raw_aligned_obj = obj_dir / "raw.aligned.tmp.obj"
     tmp_manifold_aligned_obj = obj_dir / "manifold.aligned.tmp.obj"
+    tmp_coacd_aligned_obj = obj_dir / "coacd.aligned.tmp.obj"
     meshes_dir = obj_dir / "meshes"
     ensure_dir(str(meshes_dir))
 
@@ -983,21 +947,28 @@ def process_object(
         print(f"    ERROR: {rec['error']}")
         return rec
 
-    # Step 1: manifold from raw + topology/volume validation
+    # Step 1: run CoACD once to produce manifold.obj and coacd.obj
+    ran_joint_coacd = False
     try:
-        need_manifold = bool(process_cfg["force"]) or (not dst_manifold_obj.exists())
-        if need_manifold:
-            print("  running mesh_make_manifold...")
-            ret = mesh_make_manifold(
+        need_joint_coacd = (
+            bool(process_cfg["force"])
+            or (not dst_manifold_obj.exists())
+            or (not dst_coacd_obj.exists())
+        )
+        if need_joint_coacd:
+            print("  running mesh_manifold_and_convex_decomp...")
+            ret = mesh_manifold_and_convex_decomp(
                 str(src_obj),
                 str(dst_manifold_obj),
+                str(dst_coacd_obj),
                 quiet=bool(process_cfg["coacd_quiet"]),
                 timeout_sec=float(process_cfg["coacd_timeout_sec"]) if process_cfg["coacd_timeout_sec"] else None,
             )
-            if ret != 0 or (not dst_manifold_obj.exists()):
-                raise RuntimeError(f"CoACD manifold failed (ret={ret})")
+            if ret != 0 or (not dst_manifold_obj.exists()) or (not dst_coacd_obj.exists()):
+                raise RuntimeError(f"CoACD manifold/convex failed (ret={ret})")
+            ran_joint_coacd = True
         else:
-            print("  manifold exists -> skip generation")
+            print("  manifold/coacd exist -> skip CoACD")
         ok, reason = validate_manifold_mesh(dst_manifold_obj)
         if not ok:
             raise RuntimeError(f"invalid manifold: {reason}")
@@ -1079,22 +1050,20 @@ def process_object(
     finally:
         tmp_raw_aligned_obj.unlink(missing_ok=True)
 
-    # Step 4: convex decomposition from transformed manifold
+    # Step 4: transform coacd.obj to aligned principal frame and export pieces
     try:
-        need_coacd = bool(process_cfg["force"]) or (not dst_coacd_obj.exists())
-        if need_coacd:
-            print("  running mesh_convex_decomp...")
-            ret = mesh_convex_decomp(
-                str(dst_manifold_obj),
-                str(dst_coacd_obj),
-                quiet=bool(process_cfg["coacd_quiet"]),
-                timeout_sec=float(process_cfg["coacd_timeout_sec"]) if process_cfg["coacd_timeout_sec"] else None,
-            )
-            if ret != 0 or (not dst_coacd_obj.exists()):
-                raise RuntimeError(f"CoACD convex decomposition failed (ret={ret})")
-        else:
-            print("  coacd exists -> skip")
         need_convex_export = bool(process_cfg["force"]) or (not _convex_pieces_exist(meshes_dir))
+        if ran_joint_coacd or bool(process_cfg["force"]):
+            print("  transforming coacd.obj to aligned principal frame...")
+            transform_obj_text(
+                str(dst_coacd_obj),
+                str(tmp_coacd_aligned_obj),
+                world_to_aligned_principal_T,
+                mtllib_map=None,
+                flip_faces=flip_faces,
+                flip_normals=flip_faces,
+            )
+            os.replace(str(tmp_coacd_aligned_obj), str(dst_coacd_obj))
         if need_convex_export:
             print("  exporting convex pieces...")
             for old_piece in meshes_dir.glob("coacd_convex_piece_*.obj"):
@@ -1111,6 +1080,8 @@ def process_object(
         rec["error"] = f"convex export failed: {e}"
         print(f"    ERROR: {rec['error']}")
         return rec
+    finally:
+        tmp_coacd_aligned_obj.unlink(missing_ok=True)
 
     # Step 5: simplify (ACVD)
     try:

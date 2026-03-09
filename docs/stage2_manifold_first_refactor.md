@@ -8,7 +8,7 @@ The previous Stage-2 pipeline computed principal inertia directly from `raw.obj`
 
 Stage-2 (`src/process_meshes.py`) is now manifold-first:
 
-1. Run CoACD remesh first to generate `manifold.obj` from `raw.obj`.
+1. Run CoACD once to generate `manifold.obj` and `coacd.obj` from `raw.obj`.
 2. Validate `manifold.obj` with trimesh:
    - `is_watertight == True`
    - `is_volume == True`
@@ -17,14 +17,13 @@ Stage-2 (`src/process_meshes.py`) is now manifold-first:
 4. Apply the principal-frame transform to `manifold.obj` and overwrite it.
 5. Apply the same transform to `raw.obj` (temporary file), then directly generate `visual.obj`.
    - `inertia.obj` is no longer generated or kept.
-6. Run convex decomposition from transformed `manifold.obj` to generate `coacd.obj` and `meshes/coacd_convex_piece_*.obj`.
+6. Apply the same transform to `coacd.obj`, then export `meshes/coacd_convex_piece_*.obj`.
 7. Run simplification from transformed `manifold.obj` to generate `simplified.obj`.
 
 ## Function-Level Refactor
 
-- Split old combined CoACD function into:
-  - `mesh_make_manifold(...)` (manifold remesh output)
-  - `mesh_convex_decomp(...)` (convex decomposition output)
+- Use one CoACD function:
+  - `mesh_manifold_and_convex_decomp(...)` (manifold remesh output + convex decomposition output)
 - `mesh_visual(...)` now accepts explicit source OBJ path.
 - Old `mesh_transform(...)` output behavior was replaced with `compute_principal_transform(...)`:
   - compute transform/inertia metadata only

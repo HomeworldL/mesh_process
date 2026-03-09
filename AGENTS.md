@@ -59,7 +59,7 @@ Build `third_party/CoACD` and `third_party/ACVD` binaries before running `proces
 
 - Input: `assets/objects/processed/<dataset>/<object_id>/raw.obj`
 - Per-object steps:
-  - `mesh_make_manifold` (CoACD remesh) -> `manifold.obj`
+  - `mesh_manifold_and_convex_decomp` (single CoACD run) -> `manifold.obj`, `coacd.obj`
     - if generation fails, object is failed
     - `manifold.obj` must satisfy `trimesh.is_watertight=True` and `trimesh.is_volume=True`, otherwise object is failed
   - principal inertia computation is performed on `manifold.obj` (not on raw)
@@ -67,7 +67,7 @@ Build `third_party/CoACD` and `third_party/ACVD` binaries before running `proces
     - principal axes are assigned with signed/permuted matching so new XYZ remains as close as possible to original XYZ while still aligned to principal directions
     - transformed manifold overwrites `manifold.obj` in principal-inertia frame
   - raw mesh is transformed by the same principal-frame transform, then directly compressed to `visual.obj` (no `inertia.obj` output is kept)
-  - `mesh_convex_decomp` -> `coacd.obj`
+  - `coacd.obj` is transformed by the same principal-frame transform
   - convex export -> `meshes/coacd_convex_piece_*.obj`
   - `mesh_simplify` -> `simplified.obj` (default skip when exists)
   - `mesh_visual` -> `visual.obj` + optional visual material/texture compression outputs

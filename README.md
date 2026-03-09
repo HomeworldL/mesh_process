@@ -217,8 +217,8 @@ python src/process_meshes.py --dataset YCB --workers 8
 ```
 
 Flow per object:
-- `mesh_make_manifold`: generate `manifold.obj` from `raw.obj` using CoACD remesh output.
-  - object fails immediately if CoACD remesh fails.
+- `mesh_manifold_and_convex_decomp`: run CoACD once from `raw.obj` to generate `manifold.obj` + `coacd.obj`.
+  - object fails immediately if CoACD fails.
   - Stage-2 requires `manifold.obj` to satisfy `is_watertight=True` and `is_volume=True`; otherwise object fails.
 - principal-frame inertia step runs on `manifold.obj` (not on `raw.obj`):
   - inertia computation now directly uses trimesh built-ins: `moment_inertia`, `moment_inertia_frame`, `principal_inertia_components`, `principal_inertia_transform`.
@@ -227,8 +227,7 @@ Flow per object:
 - raw mesh is transformed by the same principal-frame transform and directly compressed to visual assets (`visual.obj`, optional `visual.mtl`, optional `visual_texture_map.png`); `inertia.obj` is no longer generated.
   - Textured objects are treated as canonical single-texture input (`textured.mtl + texture_map.png`) and produce one `visual_texture_map.png`.
   - before marking an object as success, Stage-2 validates that `visual.obj` is loadable as a non-empty scene with valid bounds.
-- `mesh_convex_decomp`: run CoACD convex decomposition from transformed `manifold.obj` to `coacd.obj`.
-- convex export: write `meshes/coacd_convex_piece_*.obj`.
+- `coacd.obj` is transformed by the same principal-frame transform, then convex export writes `meshes/coacd_convex_piece_*.obj`.
 - `mesh_simplify`: generate `simplified.obj` from transformed `manifold.obj` (skip if exists unless `--force`).
 
 Parallel and overwrite behavior:
