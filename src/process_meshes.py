@@ -847,6 +847,35 @@ def _convex_pieces_exist(meshes_dir: Path) -> bool:
     return any(meshes_dir.glob("coacd_convex_piece_*.obj"))
 
 
+def _validate_coacd_convex_piece(
+    mesh: trimesh.Trimesh,
+    min_volume: float,
+    min_extent: float,
+) -> tuple[bool, str]:
+    if bool(mesh.is_empty):
+        return False, "empty mesh"
+
+    try:
+        extents = np.asarray(mesh.bounding_box.extents, dtype=float)
+    except Exception as e:
+        return False, f"failed to read bounding box extents: {e}"
+    if extents.shape != (3,) or not np.all(np.isfinite(extents)):
+        return False, "invalid bounding box extents"
+    if float(np.max(extents)) <= float(min_extent):
+        return False, f"bbox max extent too small ({float(np.max(extents)):.6g} <= {float(min_extent):.6g})"
+
+    try:
+        vol = float(mesh.volume)
+    except Exception as e:
+        return False, f"failed to read volume: {e}"
+    if not np.isfinite(vol):
+        return False, "non-finite volume"
+    if abs(vol) <= float(min_volume):
+        return False, f"volume too small ({abs(vol):.6g} <= {float(min_volume):.6g})"
+
+    return True, ""
+
+
 def _visual_outputs_exist(obj_dir: Path) -> bool:
     visual_obj = obj_dir / "visual.obj"
     visual_mtl = obj_dir / "visual.mtl"
@@ -1069,9 +1098,30 @@ def process_object(
             for old_piece in meshes_dir.glob("coacd_convex_piece_*.obj"):
                 old_piece.unlink(missing_ok=True)
             convex_pieces = list(trimesh.load(str(dst_coacd_obj), process=False).split())
-            for i, piece in enumerate(convex_pieces):
-                piece_filepath = meshes_dir / f"coacd_convex_piece_{i}.obj"
+            exported_piece_count = 0
+            skipped_piece_count = 0
+            for raw_idx, piece in enumerate(convex_pieces):
+                ok_piece, piece_reason = _validate_coacd_convex_piece(
+                    piece,
+                    min_volume=float(process_cfg["coacd_piece_min_volume"]),
+                    min_extent=float(process_cfg["coacd_piece_min_extent"]),
+                )
+                if not ok_piece:
+                    skipped_piece_count += 1
+                    print(f"    skip convex piece {raw_idx}: {piece_reason}")
+                    continue
+                piece_filepath = meshes_dir / f"coacd_convex_piece_{exported_piece_count}.obj"
                 export_mesh(piece, str(piece_filepath))
+                exported_piece_count += 1
+            if exported_piece_count <= 0:
+                raise RuntimeError(
+                    "all convex pieces were filtered out by mesh validity checks"
+                )
+            if skipped_piece_count > 0:
+                print(
+                    f"    exported {exported_piece_count} convex pieces, "
+                    f"skipped {skipped_piece_count} invalid pieces"
+                )
         else:
             print("  convex pieces exist -> skip")
         wrls = obj_dir / "coacd.wrl"
@@ -1227,6 +1277,8 @@ def process_dataset(dataset_root: Path, args: argparse.Namespace) -> None:
         "visual_texture_max_size": int(args.visual_texture_max_size),
         "visual_texture_format": str(args.visual_texture_format),
         "visual_jpeg_quality": int(args.visual_jpeg_quality),
+        "coacd_piece_min_volume": float(args.coacd_piece_min_volume),
+        "coacd_piece_min_extent": float(args.coacd_piece_min_extent),
     }
     tasks: list[tuple[int, int, str, str, float, dict]] = []
 
@@ -1407,6 +1459,18 @@ def parse_args():
         type=int,
         default=85,
         help="JPEG quality for visual texture (when format=jpg and no alpha).",
+    )
+    p.add_argument(
+        "--coacd-piece-min-volume",
+        type=float,
+        default=1e-12,
+        help="Skip exported CoACD convex pieces whose absolute volume is <= this threshold.",
+    )
+    p.add_argument(
+        "--coacd-piece-min-extent",
+        type=float,
+        default=1e-6,
+        help="Skip exported CoACD convex pieces whose max bbox extent is <= this threshold.",
     )
     args = p.parse_args()
 

@@ -27,7 +27,7 @@ except Exception:  # pragma: no cover - tqdm optional
 class DGNAdapter(BaseIngestAdapter):
     source_name = "DGN"
     version = None
-    normalized_default_mass_kg = 10.0
+    normalized_default_mass_kg = 50.0
 
     default_url = (
         "https://huggingface.co/datasets/JiayiChenPKU/BODex/resolve/main/"

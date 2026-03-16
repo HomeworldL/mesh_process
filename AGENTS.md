@@ -30,7 +30,7 @@
     - pre `max_extent <= 1e-9` or pre aspect ratio (`max_extent/min_extent`) `> 1e5`
     - post `max_extent` not in `[0.95, 1.05]` or post center norm `> 5e-3`
 - Normalization + default mass policy:
-  - normalized datasets: `ShapeNetCore`, `ShapeNetSem`, `DGN`, `DDG` -> default `mass_kg=10.0`
+  - normalized datasets: `ShapeNetCore`, `ShapeNetSem`, `DGN`, `DDG` -> default `mass_kg=50.0`
   - non-normalized datasets: `YCB`, `RealDex`, `GraspNet`, `HOPE`, `KIT`, `MSO`, `Objaverse`, `DexNet` -> default `mass_kg=0.1`
 
 ## Build, Test, and Development Commands
@@ -69,6 +69,7 @@ Build `third_party/CoACD` and `third_party/ACVD` binaries before running `proces
   - raw mesh is transformed by the same principal-frame transform, then directly compressed to `visual.obj` (no `inertia.obj` output is kept)
   - `coacd.obj` is transformed by the same principal-frame transform
   - convex export -> `meshes/coacd_convex_piece_*.obj`
+    - invalid CoACD parts are skipped during export if empty, if bbox max extent is below threshold, or if absolute volume is below threshold
   - `mesh_simplify` -> `simplified.obj` (default skip when exists)
   - `mesh_visual` -> `visual.obj` + optional visual material/texture compression outputs
     - textured input is canonical single texture (`textured.mtl + texture_map.png`) and outputs single `visual_texture_map.png`
@@ -93,41 +94,13 @@ Build `third_party/CoACD` and `third_party/ACVD` binaries before running `proces
   - `<object_id>.urdf`
   - `<object_id>.xml`
 
-## Stage-4 Viewpoint Point Cloud Sampling (`sample_pointcloud_views.py`)
-
-- Goal:
-  - sample object-centric partial point clouds from multiple camera views for each processed object
-  - RGB interface should be reserved, but RGB data is optional in current implementation
-- Input:
-  - Stage-3 MJCF: `assets/objects/processed/<dataset>/<object_id>/<object_id>.xml`
-  - Stage-2 visual mesh and collision assets already prepared
-- Default sampling:
-  - `25` camera viewpoints per object
-  - viewpoints sampled around object center (spherical/circular strategy with small noise)
-  - each view generates one partial point cloud from rendered depth
-- Output format (one file per object):
-  - `assets/objects/processed/<dataset>/<object_id>/vision_data/pc_views.npz`
-  - suggested keys:
-    - `object_id` (string)
-    - `camera_intrinsic` (`fx, fy, cx, cy, width, height`)
-    - `camera_extrinsic` (`[25, 4, 4]`)
-    - `camera_position` (`[25, 3]`)
-    - `point_cloud` (`[25, N, 3]`, fixed `N` points per view after downsample)
-    - `valid_point_num` (`[25]`)
-    - `rgb_path` (reserved interface, optional/empty in current stage)
-- Notes:
-  - fixed `N` per view makes downstream dataloaders and batching easier than variable-length arrays
-  - keep Stage-4 independent from Stage-2/3 generation logic (no overwrite on existing meshes/descriptions)
-  - default command:
-    - `python src/sample_pointcloud_views.py --dataset YCB --views 25 --points 4096`
-
 ## Coding Style & Naming Conventions
 
 - Python 3, 4-space indentation, `snake_case` for functions/files, `PascalCase` for classes.
 - Keep scripts CLI-driven with `argparse`; avoid hardcoded machine-specific paths.
 - Preserve dataset-agnostic path conventions under `assets/objects/{raw,processed}`.
 - Manifest mass policy:
-  - normalized datasets (`ShapeNetCore`, `ShapeNetSem`, `DGN`, `DDG`): if source mass unknown, write `mass_kg=10.0`
+  - normalized datasets (`ShapeNetCore`, `ShapeNetSem`, `DGN`, `DDG`): if source mass unknown, write `mass_kg=50.0`
   - other datasets: if source mass unknown, write `mass_kg=0.1`
 - Manifest texture policy: `has_texture` is determined only by whether `.png` texture files exist in the organized object folder.
 - Organized texture files must be `.png`; if source texture is non-png (e.g. `.jpg`), convert to `.png` during organize and do not keep the original non-png copy.
@@ -148,7 +121,7 @@ Build `third_party/CoACD` and `third_party/ACVD` binaries before running `proces
 - Use `canonicalize_texture_assets(...)` during organize if texture/mtl may exist.
 - `manifest` path fields must use repo-relative paths via `relative_to_repo(...)`.
 - `has_texture` must follow `.png`-only policy.
-- If source mass is unavailable, follow dataset policy above (`10.0` for normalized datasets; otherwise `0.1`).
+- If source mass is unavailable, follow dataset policy above (`50.0` for normalized datasets; otherwise `0.1`).
 - Prefer `tqdm` for long loops (download and organize).
 
 ## Common Issues & References

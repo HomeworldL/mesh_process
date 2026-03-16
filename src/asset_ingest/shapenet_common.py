@@ -26,7 +26,7 @@ class _ShapeNetHFBaseAdapter(BaseIngestAdapter):
     hf_repo_id: str = ""
     homepage: str = "https://huggingface.co/datasets/ShapeNet"
     required_files: list[str] = []
-    normalized_default_mass_kg: float = 10.0
+    normalized_default_mass_kg: float = 50.0
 
     @staticmethod
     def _subset_filter(cfg: IngestConfig) -> set[str] | None:

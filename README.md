@@ -118,7 +118,7 @@ Notes:
 - Download stage uses `tqdm` progress bars (YCB stream download, archive extract, Objaverse batch mirror).
 - `organize` will build `assets/objects/processed/<dataset>/manifest.json` automatically.
 - `mass_kg` is included per object; when unknown, default mass depends on dataset normalization policy:
-  - normalized object datasets (`ShapeNetCore`, `ShapeNetSem`, `DGN`, `DDG`): `10.0 kg`
+  - normalized object datasets (`ShapeNetCore`, `ShapeNetSem`, `DGN`, `DDG`): `50.0 kg`
   - non-normalized datasets (`YCB`, `RealDex`, `GraspNet`, `HOPE`, `KIT`, `MSO`, `Objaverse`, `DexNet`): `0.1 kg`
 - Canonical organized file names are: `raw.obj`, optional `texture_map.png`, optional `textured.mtl`.
   - ShapeNetSem/ShapeNetCore default behavior is OBJ-only (`raw.obj` after normalization). Texture export is optional via env (`SHAPENET_EXPORT_TEXTURES=1` or source-specific switch).
@@ -185,14 +185,14 @@ Notes:
 - Source archive is organized by `DGNAdapter`; output includes:
   - full set: `assets/objects/processed/DGN/`
   - derived subset (`ddg*` prefix): `assets/objects/processed/DDG/`
-- These two datasets are treated as normalized object models for default mass policy (`10.0 kg` when source mass is unknown).
+- These two datasets are treated as normalized object models for default mass policy (`50.0 kg` when source mass is unknown).
 
 ### ShapeNetCore / ShapeNetSem
 
 - Requires manual/authenticated archive acquisition.
 - Recommended flow: put archive under `assets/objects/raw/<dataset>/`, then run `download` + `organize`.
 - Organized output is normalized under `assets/objects/processed/<dataset>/`.
-- These datasets are treated as normalized object models for default mass policy (`10.0 kg` when source mass is unknown).
+- These datasets are treated as normalized object models for default mass policy (`50.0 kg` when source mass is unknown).
 - ShapeNetCore details:
   - `download`: selective extraction from `ShapeNetCore.v2.zip` using `filter_lists.py` (allowed synsets + denylist ids), only keeps `model_normalized.{obj,mtl,json}` and referenced `images/*`.
   - `organize`: load each OBJ then normalize geometry (AABB center -> origin, max extent -> `1.0`), drop abnormal meshes.
@@ -228,6 +228,7 @@ Flow per object:
   - Textured objects are treated as canonical single-texture input (`textured.mtl + texture_map.png`) and produce one `visual_texture_map.png`.
   - before marking an object as success, Stage-2 validates that `visual.obj` is loadable as a non-empty scene with valid bounds.
 - `coacd.obj` is transformed by the same principal-frame transform, then convex export writes `meshes/coacd_convex_piece_*.obj`.
+  - invalid CoACD parts are skipped during export if empty, if bbox max extent is below threshold, or if absolute volume is below threshold.
 - `mesh_simplify`: generate `simplified.obj` from transformed `manifold.obj` (skip if exists unless `--force`).
 
 Parallel and overwrite behavior:
@@ -260,27 +261,3 @@ Mesh usage:
 Outputs per object:
 - `<object_id>.urdf`
 - `<object_id>.xml`
-
-## Stage 4: Multi-view Point Cloud Sampling (`sample_pointcloud_views.py`)
-
-Sample partial point clouds from multiple camera viewpoints around each object:
-
-```bash
-python src/sample_pointcloud_views.py --dataset YCB --views 25 --points 4096
-```
-
-Input:
-- Stage-3 object MJCF: `<object_id>.xml`
-- Stage-2 process report: `manifest.process_meshes.json` (only `process_status=success` objects are sampled by default)
-
-Output per object:
-- `assets/objects/processed/<dataset>/<object_id>/vision_data/pc_views.npz`
-
-Default data layout in `pc_views.npz`:
-- `camera_intrinsic` (`fx, fy, cx, cy, width, height`)
-- `camera_extrinsic` (`[V, 4, 4]`)
-- `camera_position` (`[V, 3]`)
-- `camera_lookat` (`[V, 3]`)
-- `point_cloud` (`[V, N, 3]`)
-- `valid_point_num` (`[V]`)
-- `rgb_path` (reserved interface, currently empty)
