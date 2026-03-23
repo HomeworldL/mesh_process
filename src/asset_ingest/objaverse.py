@@ -10,7 +10,6 @@ import shutil
 import re
 
 from .base import (
-    CANONICAL_MTL_NAME,
     DEFAULT_MASS_KG,
     BaseIngestAdapter,
     DownloadReport,
@@ -21,7 +20,7 @@ from .base import (
     sanitize_object_id,
     tqdm,
 )
-from .manifest import IngestManifest, ManifestSource, ManifestSummary, ObjectRecord
+from .manifest import IngestManifest
 
 
 class ObjaverseAdapter(BaseIngestAdapter):
@@ -330,64 +329,10 @@ class ObjaverseAdapter(BaseIngestAdapter):
         return report
 
     def build_manifest(self, cfg: IngestConfig) -> IngestManifest:
-        raw_dir = cfg.source_processed_dir
-        manifest = IngestManifest.create(dataset=self.source_name, version=self.version)
-        manifest.source = ManifestSource(
+        return self.build_manifest_from_processed_dir(
+            cfg,
             homepage="https://objaverse.allenai.org/",
             download_method="objaverse_api",
             notes="Downloaded via objaverse.load_objects and mirrored under assets/objects/raw/Objaverse/objects",
-        )
-
-        if not raw_dir.exists():
-            manifest.summary = ManifestSummary(
-                num_objects=0,
-                num_categories=0,
-                has_texture_policy="unknown",
-                default_mass_kg=DEFAULT_MASS_KG,
-            )
-            return manifest
-
-        objects: list[ObjectRecord] = []
-        for obj_dir in sorted(p for p in raw_dir.iterdir() if p.is_dir()):
-            object_id = obj_dir.name
-            mesh_path = obj_dir / "raw.obj"
-            if not mesh_path.exists():
-                continue
-
-            mtl_candidates = [obj_dir / CANONICAL_MTL_NAME] if (obj_dir / CANONICAL_MTL_NAME).exists() else []
-            texture_files = [p.name for p in obj_dir.glob("*.png")]
-            has_texture = "true" if texture_files else "false"
-            mtl_path = mtl_candidates[0] if mtl_candidates else None
-
-            objects.append(
-                ObjectRecord(
-                    object_id=object_id,
-                    name=object_id,
-                    category=None,
-                    mesh_path=relative_to_repo(cfg.repo_root, mesh_path),
-                    mesh_format="obj",
-                    mass_kg=DEFAULT_MASS_KG,
-                    has_texture=has_texture,
-                    mtl_path=relative_to_repo(cfg.repo_root, mtl_path) if mtl_path else None,
-                    texture_files=texture_files,
-                )
-            )
-
-        texture_states = {obj.has_texture for obj in objects}
-        if texture_states == {"true"}:
-            texture_policy = "all"
-        elif texture_states == {"false"}:
-            texture_policy = "none"
-        elif not texture_states:
-            texture_policy = "unknown"
-        else:
-            texture_policy = "mixed"
-
-        manifest.objects = objects
-        manifest.summary = ManifestSummary(
-            num_objects=len(objects),
-            num_categories=0,
-            has_texture_policy=texture_policy,
             default_mass_kg=DEFAULT_MASS_KG,
         )
-        return manifest

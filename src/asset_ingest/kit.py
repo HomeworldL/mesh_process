@@ -11,7 +11,6 @@ import zipfile
 from urllib.request import urlopen
 
 from .base import (
-    CANONICAL_MTL_NAME,
     CANONICAL_RAW_OBJ_NAME,
     DEFAULT_MASS_KG,
     BaseIngestAdapter,
@@ -23,7 +22,7 @@ from .base import (
     sanitize_object_id,
     tqdm,
 )
-from .manifest import IngestManifest, ManifestSource, ManifestSummary, ObjectRecord
+from .manifest import IngestManifest
 
 
 @dataclass(frozen=True)
@@ -237,69 +236,10 @@ class KITAdapter(BaseIngestAdapter):
         return report
 
     def build_manifest(self, cfg: IngestConfig) -> IngestManifest:
-        raw_dir = cfg.source_processed_dir
-        manifest = IngestManifest.create(dataset=self.source_name, version=self.version)
-        manifest.source = ManifestSource(
+        return self.build_manifest_from_processed_dir(
+            cfg,
             homepage=self.list_url,
             download_method="http_crawl",
             notes="Crawled listAll page and downloaded per-object meshes.zip via tmp.php links",
-        )
-
-        if not raw_dir.exists():
-            manifest.summary = ManifestSummary(
-                num_objects=0,
-                num_categories=0,
-                has_texture_policy="unknown",
-                default_mass_kg=DEFAULT_MASS_KG,
-            )
-            return manifest
-
-        objects: list[ObjectRecord] = []
-        texture_true_count = 0
-        texture_false_count = 0
-
-        for obj_dir in sorted(p for p in raw_dir.iterdir() if p.is_dir()):
-            object_id = obj_dir.name
-            mesh_path = obj_dir / CANONICAL_RAW_OBJ_NAME
-            if not mesh_path.exists():
-                continue
-
-            mtl_path = obj_dir / CANONICAL_MTL_NAME
-            texture_files = [p.name for p in obj_dir.glob("*.png")]
-            has_texture = "true" if texture_files else "false"
-            if has_texture == "true":
-                texture_true_count += 1
-            else:
-                texture_false_count += 1
-
-            objects.append(
-                ObjectRecord(
-                    object_id=object_id,
-                    name=object_id,
-                    category=None,
-                    mesh_path=relative_to_repo(cfg.repo_root, mesh_path),
-                    mesh_format="obj",
-                    mass_kg=DEFAULT_MASS_KG,
-                    has_texture=has_texture,
-                    mtl_path=(relative_to_repo(cfg.repo_root, mtl_path) if mtl_path.exists() else None),
-                    texture_files=texture_files,
-                )
-            )
-
-        if texture_true_count and texture_false_count:
-            texture_policy = "mixed"
-        elif texture_true_count:
-            texture_policy = "all"
-        elif texture_false_count:
-            texture_policy = "none"
-        else:
-            texture_policy = "unknown"
-
-        manifest.objects = objects
-        manifest.summary = ManifestSummary(
-            num_objects=len(objects),
-            num_categories=0,
-            has_texture_policy=texture_policy,
             default_mass_kg=DEFAULT_MASS_KG,
         )
-        return manifest

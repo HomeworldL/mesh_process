@@ -7,7 +7,6 @@ from pathlib import Path, PurePosixPath
 import os
 import shutil
 import zipfile
-import re
 
 from .base import (
     CANONICAL_MTL_NAME,
@@ -106,77 +105,6 @@ class ShapeNetSemAdapter(_ShapeNetHFBaseAdapter):
             if (root / "models-OBJ" / "models").is_dir():
                 return root
         return None
-
-    @staticmethod
-    def _parse_mtl_texture_refs(mtl_path: Path) -> set[str]:
-        refs: set[str] = set()
-        if not mtl_path.exists():
-            return refs
-        try:
-            for raw in mtl_path.read_text(encoding="utf-8", errors="ignore").splitlines():
-                line = raw.strip()
-                if not line or line.startswith("#"):
-                    continue
-                parts = line.split()
-                if len(parts) < 2:
-                    continue
-                if parts[0].lower() not in ShapeNetSemAdapter._TEXTURE_LINE_PREFIXES:
-                    continue
-                # Skip MTL option flags (e.g. -blendu on -s 1 1 1), last token is texture path.
-                tex_token = parts[-1]
-                tex_name = Path(tex_token).name
-                if tex_name:
-                    refs.add(tex_name)
-        except Exception:
-            return refs
-        return refs
-
-    @staticmethod
-    def _copy_texture_to_png(src_path: Path, dst_png_path: Path) -> bool:
-        """Copy image to PNG format; return True on success."""
-        try:
-            from PIL import Image  # type: ignore
-
-            with Image.open(src_path) as img:
-                # Keep alpha when present.
-                if img.mode not in ("RGB", "RGBA"):
-                    img = img.convert("RGBA" if "A" in img.getbands() else "RGB")
-                img.save(dst_png_path, format="PNG")
-            return True
-        except Exception:
-            return False
-
-    @staticmethod
-    def _rewrite_mtl_with_local_textures(
-        src_mtl: Path, dst_mtl: Path, texture_rename_map: dict[str, str]
-    ) -> None:
-        out_lines: list[str] = []
-        try:
-            lines = src_mtl.read_text(encoding="utf-8", errors="ignore").splitlines()
-        except Exception:
-            lines = []
-
-        for raw in lines:
-            line = raw.rstrip("\n")
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
-                out_lines.append(line)
-                continue
-
-            parts = stripped.split()
-            if len(parts) >= 2 and parts[0].lower() in ShapeNetSemAdapter._TEXTURE_LINE_PREFIXES:
-                tex_token = parts[-1]
-                tex_name = Path(tex_token).name
-                if tex_name in texture_rename_map:
-                    parts[-1] = texture_rename_map[tex_name]
-                    prefix = re.match(r"^\s*", line).group(0) if line else ""
-                    out_lines.append(prefix + " ".join(parts))
-                    continue
-            out_lines.append(line)
-
-        if not out_lines:
-            out_lines = ["newmtl material_0"]
-        dst_mtl.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
 
     def _prepare_after_download(self, cfg: IngestConfig, snapshot_dir: Path, report: DownloadReport) -> None:
         zip_path = snapshot_dir / "ShapeNetSem.zip"
@@ -367,7 +295,7 @@ class ShapeNetSemAdapter(_ShapeNetHFBaseAdapter):
             if dst_obj.exists() and not cfg.force:
                 continue
 
-            ok_norm, norm_reason, norm_metrics = self._normalize_obj_center_and_scale(
+            ok_norm, norm_reason, norm_metrics = self.normalize_obj_center_and_scale(
                 src_obj_path=src_obj,
                 dst_obj_path=dst_obj,
             )
@@ -382,11 +310,18 @@ class ShapeNetSemAdapter(_ShapeNetHFBaseAdapter):
 
             if export_textures:
                 texture_src: Path | None = None
-                texture_refs = self._parse_mtl_texture_refs(src_mtl) if src_mtl.is_file() else set()
+                texture_refs = (
+                    self._parse_mtl_texture_refs(
+                        src_mtl,
+                        texture_line_prefixes=self._TEXTURE_LINE_PREFIXES,
+                    )
+                    if src_mtl.is_file()
+                    else []
+                )
                 has_jpg_in_source_mtl = any(Path(x).suffix.lower() in {".jpg", ".jpeg"} for x in texture_refs)
                 texture_rename_map: dict[str, str] = {}
                 copied_textures: list[tuple[str, Path]] = []
-                for tex_name in sorted(texture_refs):
+                for tex_name in texture_refs:
                     candidate = texture_by_name.get(tex_name)
                     if candidate is None or not candidate.is_file():
                         continue
@@ -416,6 +351,7 @@ class ShapeNetSemAdapter(_ShapeNetHFBaseAdapter):
                         src_mtl=src_mtl,
                         dst_mtl=canonical_mtl,
                         texture_rename_map=texture_rename_map,
+                        texture_line_prefixes=self._TEXTURE_LINE_PREFIXES,
                     )
                     rewrite_obj_material_refs(obj_path=dst_obj, mtl_name=CANONICAL_MTL_NAME)
                 elif texture_src is not None:

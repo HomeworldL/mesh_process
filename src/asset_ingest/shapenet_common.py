@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from pathlib import Path, PurePosixPath
-import math
 import os
+import re
 import shutil
 import zipfile
 
@@ -19,7 +19,7 @@ from .base import (
     relative_to_repo,
     tqdm,
 )
-from .manifest import IngestManifest, ManifestSource, ManifestSummary, ObjectRecord
+from .manifest import IngestManifest
 
 
 class _ShapeNetHFBaseAdapter(BaseIngestAdapter):
@@ -109,142 +109,77 @@ class _ShapeNetHFBaseAdapter(BaseIngestAdapter):
         """Dataset-specific extraction prep; subclasses override."""
 
     @staticmethod
-    def _normalize_obj_center_and_scale(
-        src_obj_path: Path,
-        dst_obj_path: Path,
+    def _parse_mtl_texture_refs(
+        mtl_path: Path,
         *,
-        target_max_extent: float = 1.0,
-        min_extent_eps: float = 1e-9,
-        max_aspect_ratio: float = 1e5,
-    ) -> tuple[bool, str, dict[str, float]]:
-        """
-        Load OBJ for validation, then normalize geometry:
-        - center to origin by AABB center
-        - uniform scale so max AABB extent == target_max_extent
-
-        Returns:
-          (success, reason, metrics)
-        metrics keys:
-          pre_min_extent, pre_max_extent, pre_aspect_ratio, post_max_extent, post_center_norm
-        """
-        metrics: dict[str, float] = {}
+        texture_line_prefixes: tuple[str, ...],
+    ) -> list[str]:
+        refs: list[str] = []
+        if not mtl_path.exists():
+            return refs
         try:
-            import trimesh  # type: ignore
-        except Exception as e:
-            return False, f"trimesh unavailable: {e}", metrics
+            for raw in mtl_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                if parts[0].lower() not in texture_line_prefixes:
+                    continue
+                tex_name = Path(parts[-1]).name
+                if tex_name and tex_name not in refs:
+                    refs.append(tex_name)
+        except Exception:
+            return refs
+        return refs
 
+    @staticmethod
+    def _copy_texture_to_png(src_path: Path, dst_png_path: Path) -> bool:
         try:
-            loaded = trimesh.load(
-                str(src_obj_path),
-                force="mesh",
-                process=False,
-                maintain_order=True,
-            )
-        except Exception as e:
-            return False, f"failed to load obj: {e}", metrics
+            from PIL import Image  # type: ignore
 
-        if not isinstance(loaded, trimesh.Trimesh) or loaded.vertices is None or len(loaded.vertices) == 0:
-            return False, "loaded object has no valid mesh vertices", metrics
+            with Image.open(src_path) as img:
+                if img.mode not in ("RGB", "RGBA"):
+                    img = img.convert("RGBA" if "A" in img.getbands() else "RGB")
+                img.save(dst_png_path, format="PNG")
+            return True
+        except Exception:
+            return False
 
-        bounds = loaded.bounds
-        if bounds is None or len(bounds) != 2:
-            return False, "loaded object has invalid bounds", metrics
-
-        extent = bounds[1] - bounds[0]
-        if not all(math.isfinite(float(x)) for x in extent):
-            return False, "non-finite bounds extent", metrics
-
-        pre_max_extent = float(max(extent))
-        pre_min_extent = float(min(extent))
-        pre_aspect_ratio = float(pre_max_extent / max(pre_min_extent, min_extent_eps))
-        metrics["pre_max_extent"] = pre_max_extent
-        metrics["pre_min_extent"] = pre_min_extent
-        metrics["pre_aspect_ratio"] = pre_aspect_ratio
-
-        if pre_max_extent <= min_extent_eps:
-            return False, f"degenerate mesh extent: max_extent={pre_max_extent:.3e}", metrics
-        if pre_aspect_ratio > max_aspect_ratio:
-            return (
-                False,
-                (
-                    "extreme aspect ratio before normalization: "
-                    f"{pre_aspect_ratio:.3e} > {max_aspect_ratio:.3e}"
-                ),
-                metrics,
-            )
-
-        center = (bounds[0] + bounds[1]) * 0.5
-        scale = float(target_max_extent / pre_max_extent)
-
+    @staticmethod
+    def _rewrite_mtl_with_local_textures(
+        src_mtl: Path,
+        dst_mtl: Path,
+        texture_rename_map: dict[str, str],
+        *,
+        texture_line_prefixes: tuple[str, ...],
+    ) -> None:
+        out_lines: list[str] = []
         try:
-            lines = src_obj_path.read_text(encoding="utf-8", errors="ignore").splitlines()
-        except Exception as e:
-            return False, f"failed reading obj text: {e}", metrics
+            lines = src_mtl.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except Exception:
+            lines = []
 
-        out_lines = list(lines)
-        vertex_count = 0
-        for idx, line in enumerate(lines):
-            if not line.startswith("v "):
+        for raw in lines:
+            line = raw.rstrip("\n")
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                out_lines.append(line)
                 continue
-            toks = line.split()
-            if len(toks) < 4:
-                continue
-            try:
-                vx = (float(toks[1]) - float(center[0])) * scale
-                vy = (float(toks[2]) - float(center[1])) * scale
-                vz = (float(toks[3]) - float(center[2])) * scale
-            except Exception:
-                continue
-            out_lines[idx] = f"v {vx:.9f} {vy:.9f} {vz:.9f}"
-            vertex_count += 1
+            parts = stripped.split()
+            if len(parts) >= 2 and parts[0].lower() in texture_line_prefixes:
+                tex_name = Path(parts[-1]).name
+                if tex_name in texture_rename_map:
+                    parts[-1] = texture_rename_map[tex_name]
+                    prefix = re.match(r"^\s*", line).group(0) if line else ""
+                    out_lines.append(prefix + " ".join(parts))
+                    continue
+            out_lines.append(line)
 
-        if vertex_count == 0:
-            return False, "no valid 'v' records found in obj text", metrics
-
-        dst_obj_path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
-
-        try:
-            post_mesh = trimesh.load(
-                str(dst_obj_path),
-                force="mesh",
-                process=False,
-                maintain_order=True,
-            )
-        except Exception as e:
-            return False, f"failed to reload normalized obj: {e}", metrics
-
-        if not isinstance(post_mesh, trimesh.Trimesh) or post_mesh.bounds is None:
-            return False, "normalized obj has invalid bounds", metrics
-
-        post_extent = post_mesh.bounds[1] - post_mesh.bounds[0]
-        if not all(math.isfinite(float(x)) for x in post_extent):
-            return False, "normalized obj extent is non-finite", metrics
-        post_max_extent = float(max(post_extent))
-        post_center = (post_mesh.bounds[0] + post_mesh.bounds[1]) * 0.5
-        post_center_norm = float(math.sqrt(float(post_center[0]) ** 2 + float(post_center[1]) ** 2 + float(post_center[2]) ** 2))
-        metrics["post_max_extent"] = post_max_extent
-        metrics["post_center_norm"] = post_center_norm
-
-        if not (0.95 * target_max_extent <= post_max_extent <= 1.05 * target_max_extent):
-            return (
-                False,
-                (
-                    "normalized size out of expected range: "
-                    f"post_max_extent={post_max_extent:.6f}, target={target_max_extent:.6f}"
-                ),
-                metrics,
-            )
-        if post_center_norm > 5e-3:
-            return (
-                False,
-                (
-                    "normalized center drift too large: "
-                    f"center_norm={post_center_norm:.6e}"
-                ),
-                metrics,
-            )
-
-        return True, "normalized", metrics
+        if not out_lines:
+            out_lines = ["newmtl material_0"]
+        dst_mtl.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
 
     @staticmethod
     def _bake_single_texture_png(
@@ -420,76 +355,13 @@ class _ShapeNetHFBaseAdapter(BaseIngestAdapter):
         return report
 
     def build_manifest(self, cfg: IngestConfig) -> IngestManifest:
-        processed_dir = cfg.source_processed_dir
-        manifest = IngestManifest.create(dataset=self.source_name, version=self.version)
-        manifest.source = ManifestSource(
+        return self.build_manifest_from_processed_dir(
+            cfg,
             homepage=self.homepage,
             download_method="huggingface_snapshot_download",
             notes=f"HF dataset repo: {self.hf_repo_id}",
-        )
-
-        if not processed_dir.exists():
-            manifest.summary = ManifestSummary(
-                num_objects=0,
-                num_categories=0,
-                has_texture_policy="unknown",
-                default_mass_kg=self.normalized_default_mass_kg,
-            )
-            return manifest
-
-        objects: list[ObjectRecord] = []
-        categories = set()
-        tex_true = 0
-        tex_false = 0
-
-        for obj_dir in sorted(p for p in processed_dir.iterdir() if p.is_dir()):
-            object_id = obj_dir.name
-            mesh_path = obj_dir / CANONICAL_RAW_OBJ_NAME
-            if not mesh_path.exists():
-                continue
-
-            category = None
-            parts = object_id.split("_")
-            if len(parts) >= 3:
-                category = parts[1]
-                categories.add(category)
-
-            mtl_path = obj_dir / CANONICAL_MTL_NAME
-            texture_files = [p.name for p in obj_dir.glob("*.png")]
-            has_texture = "true" if texture_files else "false"
-            if has_texture == "true":
-                tex_true += 1
-            else:
-                tex_false += 1
-
-            objects.append(
-                ObjectRecord(
-                    object_id=object_id,
-                    name=object_id,
-                    category=category,
-                    mesh_path=relative_to_repo(cfg.repo_root, mesh_path),
-                    mesh_format="obj",
-                    mass_kg=self.normalized_default_mass_kg,
-                    has_texture=has_texture,
-                    mtl_path=(relative_to_repo(cfg.repo_root, mtl_path) if mtl_path.exists() else None),
-                    texture_files=texture_files,
-                )
-            )
-
-        if tex_true and tex_false:
-            texture_policy = "mixed"
-        elif tex_true:
-            texture_policy = "all"
-        elif tex_false:
-            texture_policy = "none"
-        else:
-            texture_policy = "unknown"
-
-        manifest.objects = objects
-        manifest.summary = ManifestSummary(
-            num_objects=len(objects),
-            num_categories=len(categories),
-            has_texture_policy=texture_policy,
             default_mass_kg=self.normalized_default_mass_kg,
+            category_resolver=lambda object_id, _obj_dir: (
+                object_id.split("_")[1] if len(object_id.split("_")) >= 3 else None
+            ),
         )
-        return manifest

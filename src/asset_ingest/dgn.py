@@ -16,7 +16,7 @@ from .base import (
     relative_to_repo,
     sanitize_object_id,
 )
-from .manifest import IngestManifest, ManifestSource, ManifestSummary, ObjectRecord
+from .manifest import IngestManifest
 
 try:
     from tqdm import tqdm
@@ -87,48 +87,19 @@ class DGNAdapter(BaseIngestAdapter):
         return report
 
     def _build_manifest_for_dataset(self, cfg: IngestConfig, dataset_name: str) -> IngestManifest:
-        processed_dir = cfg.processed_root / dataset_name
-        manifest = IngestManifest.create(dataset=dataset_name, version=self.version)
-        manifest.source = ManifestSource(
+        # DGNAdapter organizes one source archive into two processed datasets (DGN + DDG),
+        # so this helper reuses the shared manifest builder for either target dataset.
+        return self.build_manifest_from_processed_dir(
+            cfg,
             homepage="https://huggingface.co/datasets/JiayiChenPKU/BODex",
             download_method="url_zip",
             notes="Derived from DGN_obj_raw.zip; object split by prefix into DGN / DDG",
-        )
-        if not processed_dir.exists():
-            manifest.summary = ManifestSummary(
-                num_objects=0,
-                num_categories=0,
-                has_texture_policy="none",
-                default_mass_kg=self.normalized_default_mass_kg,
-            )
-            return manifest
-
-        objects: list[ObjectRecord] = []
-        for obj_dir in sorted(p for p in processed_dir.iterdir() if p.is_dir()):
-            mesh_path = obj_dir / CANONICAL_RAW_OBJ_NAME
-            if not mesh_path.exists():
-                continue
-            objects.append(
-                ObjectRecord(
-                    object_id=obj_dir.name,
-                    name=obj_dir.name,
-                    category=None,
-                    mesh_path=relative_to_repo(cfg.repo_root, mesh_path),
-                    mesh_format="obj",
-                    mass_kg=self.normalized_default_mass_kg,
-                    has_texture="false",
-                    mtl_path=None,
-                    texture_files=[],
-                )
-            )
-        manifest.objects = objects
-        manifest.summary = ManifestSummary(
-            num_objects=len(objects),
-            num_categories=0,
-            has_texture_policy="none",
             default_mass_kg=self.normalized_default_mass_kg,
+            dataset_name=dataset_name,
+            processed_dir=cfg.processed_root / dataset_name,
+            missing_has_texture_policy="none",
+            mtl_resolver=lambda _obj_dir: None,
         )
-        return manifest
 
     def organize(self, cfg: IngestConfig) -> OrganizeReport:
         src_root = self._resolve_extract_root(cfg.source_download_dir)
@@ -160,6 +131,8 @@ class DGNAdapter(BaseIngestAdapter):
         seen_ddg: set[str] = set()
         ddg_count = 0
         dgn_count = 0
+        normalized_count = 0
+        dropped_bad_scale = 0
 
         for src_obj in obj_iter:
             raw_name = sanitize_object_id(src_obj.stem)
@@ -181,13 +154,26 @@ class DGNAdapter(BaseIngestAdapter):
                 shutil.rmtree(dgn_dst_dir)
             dgn_dst_dir.mkdir(parents=True, exist_ok=True)
             dgn_dst_obj = dgn_dst_dir / CANONICAL_RAW_OBJ_NAME
+            dgn_ready = dgn_dst_obj.exists() and not cfg.force
             if not dgn_dst_obj.exists() or cfg.force:
-                shutil.copy2(src_obj, dgn_dst_obj)
+                ok_norm, norm_reason, norm_metrics = self.normalize_obj_center_and_scale(
+                    src_obj_path=src_obj,
+                    dst_obj_path=dgn_dst_obj,
+                )
+                if not ok_norm:
+                    dropped_bad_scale += 1
+                    report.failed_items.append(
+                        f"drop {src_obj.name}: normalize failed ({norm_reason}); metrics={norm_metrics}"
+                    )
+                    shutil.rmtree(dgn_dst_dir, ignore_errors=True)
+                    continue
+                normalized_count += 1
                 dgn_count += 1
                 report.organized_objects += 1
+                dgn_ready = True
 
             # 2) Additionally export DDG subset (prefix ddg*).
-            if raw_name.lower().startswith("ddg"):
+            if raw_name.lower().startswith("ddg") and dgn_ready:
                 ddg_suffix = raw_name
                 raw_lower = raw_name.lower()
                 if raw_lower.startswith("ddg_"):
@@ -213,7 +199,7 @@ class DGNAdapter(BaseIngestAdapter):
                 ddg_dst_dir.mkdir(parents=True, exist_ok=True)
                 ddg_dst_obj = ddg_dst_dir / CANONICAL_RAW_OBJ_NAME
                 if not ddg_dst_obj.exists() or cfg.force:
-                    shutil.copy2(src_obj, ddg_dst_obj)
+                    shutil.copy2(dgn_dst_obj, ddg_dst_obj)
                     ddg_count += 1
 
         # Keep ingest CLI compatibility: DGN source manifest at processed/DGN/manifest.json
@@ -224,9 +210,22 @@ class DGNAdapter(BaseIngestAdapter):
         ddg_manifest.save(ddg_manifest_path)
 
         report.notes.append(f"organized from: {relative_to_repo(cfg.repo_root, src_root)}")
+        report.notes.append(
+            "DGN/DDG normalize policy: center=AABB center to origin, scale=max_extent to 1.0; "
+            "drop if pre_max_extent<=1e-9 or pre_aspect_ratio>1e5 or post_max_extent not in [0.95,1.05] or post_center_norm>5e-3"
+        )
+        report.notes.append(
+            f"DGN/DDG normalize stats: normalized={normalized_count}, dropped_bad_scale={dropped_bad_scale}"
+        )
         report.notes.append(f"DGN objects (full set): {dgn_count}")
         report.notes.append(f"DDG objects (subset, prefix ddg*): {ddg_count}")
         report.notes.append(f"DDG manifest: {relative_to_repo(cfg.repo_root, ddg_manifest_path)}")
+        self.append_bbox_stats_for_dataset(
+            cfg,
+            report,
+            dataset_dir=ddg_processed_dir,
+            dataset_name="DDG",
+        )
         return report
 
     def build_manifest(self, cfg: IngestConfig) -> IngestManifest:
