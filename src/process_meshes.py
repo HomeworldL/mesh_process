@@ -23,11 +23,13 @@ import json
 import time
 import subprocess
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 import numpy as np
 import trimesh
+from trimesh.exchange.obj import export_obj
 from trimesh.exchange.export import export_mesh
 try:
     import pymeshlab  # type: ignore
@@ -564,6 +566,48 @@ def mesh_slim_obj_text(src_obj, dst_obj, decimals=6, force_mtllib=None, force_us
         fout.writelines(out_lines)
 
 
+def export_visual_obj_with_trimesh(
+    src_obj,
+    dst_obj,
+    *,
+    decimals=6,
+    mtl_name=None,
+    include_texture=False,
+):
+    """
+    Re-export a decimated OBJ through trimesh to normalize face/normal formatting.
+    """
+    try:
+        mesh = trimesh.load(str(src_obj), process=False, force="mesh", maintain_order=True)
+    except Exception as e:
+        raise RuntimeError(f"failed to load decimated visual OBJ {src_obj}: {e}") from e
+
+    if isinstance(mesh, trimesh.Scene):
+        if not getattr(mesh, "geometry", None):
+            raise RuntimeError(f"decimated visual OBJ loaded as empty scene: {src_obj}")
+        try:
+            mesh = trimesh.util.concatenate(tuple(mesh.geometry.values()))
+        except Exception as e:
+            raise RuntimeError(f"failed to concatenate visual scene geometry {src_obj}: {e}") from e
+
+    try:
+        obj_text = export_obj(
+            mesh,
+            include_normals=True,
+            include_texture=bool(include_texture),
+            mtl_name=mtl_name,
+            digits=int(decimals),
+        )
+    except Exception as e:
+        raise RuntimeError(f"failed to export normalized visual OBJ {dst_obj}: {e}") from e
+
+    try:
+        with open(dst_obj, "w", encoding="utf-8", errors="ignore") as fout:
+            fout.write(obj_text)
+    except Exception as e:
+        raise RuntimeError(f"failed writing visual OBJ {dst_obj}: {e}") from e
+
+
 def mesh_compress_texture(src_tex, dst_tex, max_size=1024, jpg_quality=85):
     with Image.open(src_tex) as img:
         img = img.convert("RGBA") if img.mode in ("P", "LA") else img
@@ -675,13 +719,13 @@ def mesh_visual(obj_dir, args, src_obj: str | Path | None = None):
         if visual_mtl.exists():
             visual_mtl.unlink(missing_ok=True)
 
-    # Step E: text slimming.
-    mesh_slim_obj_text(
+    # Step E: canonical OBJ export through trimesh after decimation.
+    export_visual_obj_with_trimesh(
         src_obj=str(tmp_decimated),
         dst_obj=str(visual_obj),
         decimals=int(args.visual_obj_decimals),
-        force_mtllib=force_mtllib,
-        force_usemtl=material_name if force_mtllib is not None else None,
+        mtl_name=force_mtllib,
+        include_texture=force_mtllib is not None,
     )
     tmp_decimated.unlink(missing_ok=True)
     (obj_dir / f"{tmp_decimated.name}.mtl").unlink(missing_ok=True)
@@ -941,6 +985,69 @@ def validate_visual_obj_loadable(obj_dir: Path) -> tuple[bool, str | None]:
     return True, None
 
 
+def detect_visual_needs_flip(
+    manifold_obj: Path,
+    visual_obj: Path,
+    *,
+    max_face_samples: int = 2048,
+) -> tuple[bool, str]:
+    """
+    Compare visual face normals against nearest manifold face normals.
+    Returns (needs_flip, debug_reason).
+    """
+    try:
+        manifold_mesh = trimesh.load(str(manifold_obj), process=False, force="mesh")
+        visual_mesh = trimesh.load(str(visual_obj), process=False, force="mesh")
+    except Exception as e:
+        return False, f"load failed: {e}"
+
+    if isinstance(manifold_mesh, trimesh.Scene):
+        if not getattr(manifold_mesh, "geometry", None):
+            return False, "manifold loaded as empty scene"
+        manifold_mesh = trimesh.util.concatenate(tuple(manifold_mesh.geometry.values()))
+    if isinstance(visual_mesh, trimesh.Scene):
+        if not getattr(visual_mesh, "geometry", None):
+            return False, "visual loaded as empty scene"
+        visual_mesh = trimesh.util.concatenate(tuple(visual_mesh.geometry.values()))
+
+    if len(manifold_mesh.faces) == 0 or len(visual_mesh.faces) == 0:
+        return False, "empty face set"
+
+    try:
+        visual_centers = np.asarray(visual_mesh.triangles_center, dtype=float)
+        visual_normals = np.asarray(visual_mesh.face_normals, dtype=float)
+        if len(visual_centers) > int(max_face_samples):
+            sample_idx = np.linspace(
+                0,
+                len(visual_centers) - 1,
+                num=int(max_face_samples),
+                dtype=int,
+            )
+            visual_centers = visual_centers[sample_idx]
+            visual_normals = visual_normals[sample_idx]
+        _, _, triangle_id = trimesh.proximity.closest_point(manifold_mesh, visual_centers)
+        ref_normals = np.asarray(manifold_mesh.face_normals, dtype=float)[np.asarray(triangle_id, dtype=int)]
+    except Exception as e:
+        return False, f"closest-point comparison failed: {e}"
+
+    valid = (
+        np.all(np.isfinite(visual_normals), axis=1)
+        & np.all(np.isfinite(ref_normals), axis=1)
+    )
+    if not np.any(valid):
+        return False, "no valid normal pairs"
+
+    dots = np.einsum("ij,ij->i", visual_normals[valid], ref_normals[valid])
+    negative_ratio = float((dots < 0.0).mean())
+    positive_ratio = float((dots > 0.0).mean())
+    needs_flip = negative_ratio > 0.5 and negative_ratio > positive_ratio
+    reason = (
+        f"normal agreement: compared={len(dots)}, sampled_from={len(visual_mesh.faces)}, "
+        f"positive_ratio={positive_ratio:.3f}, negative_ratio={negative_ratio:.3f}"
+    )
+    return needs_flip, reason
+
+
 def process_object(
     idx: int,
     total: int,
@@ -957,6 +1064,7 @@ def process_object(
     tmp_raw_aligned_obj = obj_dir / "raw.aligned.tmp.obj"
     tmp_manifold_aligned_obj = obj_dir / "manifold.aligned.tmp.obj"
     tmp_coacd_aligned_obj = obj_dir / "coacd.aligned.tmp.obj"
+    tmp_visual_flipped_obj = obj_dir / "visual.flipped.tmp.obj"
     meshes_dir = obj_dir / "meshes"
     ensure_dir(str(meshes_dir))
 
@@ -1066,6 +1174,19 @@ def process_object(
         visual_tex = next(iter(sorted(obj_dir.glob("visual_texture_map*.png"))), None)
         if visual_tex is None:
             visual_tex = next(iter(sorted(obj_dir.glob("visual_texture_map*.jpg"))), None)
+        needs_visual_flip, flip_reason = detect_visual_needs_flip(dst_manifold_obj, visual_obj)
+        print(f"  visual orientation check: {flip_reason}")
+        if needs_visual_flip:
+            print("  flipping visual.obj orientation to match manifold...")
+            transform_obj_text(
+                str(visual_obj),
+                str(tmp_visual_flipped_obj),
+                np.eye(4, dtype=float),
+                mtllib_map=None,
+                flip_faces=True,
+                flip_normals=True,
+            )
+            os.replace(str(tmp_visual_flipped_obj), str(visual_obj))
         rec["visual_obj_path"] = str(visual_obj) if visual_obj.exists() else None
         rec["visual_mtl_path"] = str(visual_mtl) if visual_mtl.exists() else None
         rec["visual_texture_path"] = str(visual_tex) if visual_tex is not None else None
@@ -1078,6 +1199,7 @@ def process_object(
         return rec
     finally:
         tmp_raw_aligned_obj.unlink(missing_ok=True)
+        tmp_visual_flipped_obj.unlink(missing_ok=True)
 
     # Step 4: transform coacd.obj to aligned principal frame and export pieces
     try:
@@ -1324,13 +1446,37 @@ def process_dataset(dataset_root: Path, args: argparse.Namespace) -> None:
         print(f"Running in parallel with {workers} workers...")
         with ProcessPoolExecutor(max_workers=workers) as ex:
             future_map = {ex.submit(process_object_task, t): t[2] for t in tasks}
+            pool_broken = False
             for fut in as_completed(future_map):
                 oid = future_map[fut]
                 try:
                     ret_oid, rec = fut.result()
                     per_object[ret_oid] = rec
+                except BrokenProcessPool as e:
+                    print(
+                        "ERROR: worker crashed while processing "
+                        f"{oid}; likely native tool crash (CoACD/ACVD): {e}"
+                    )
+                    per_object[oid] = {
+                        "status": "failed",
+                        "error": f"worker crashed while processing {oid}; likely native tool crash (CoACD/ACVD): {e}",
+                    }
+                    pool_broken = True
+                    break
                 except Exception as e:
+                    print(f"ERROR: worker failed on {oid}: {e}")
                     per_object[oid] = {"status": "failed", "error": f"worker crash: {e}"}
+            if pool_broken:
+                for pending_fut, pending_oid in future_map.items():
+                    if pending_oid in per_object:
+                        continue
+                    per_object[pending_oid] = {
+                        "status": "failed",
+                        "error": (
+                            "not processed because ProcessPoolExecutor became broken after "
+                            f"worker crash near {oid}; likely native tool crash (CoACD/ACVD)"
+                        ),
+                    }
 
     elapsed = time.perf_counter() - t0
     report_path = write_process_report(

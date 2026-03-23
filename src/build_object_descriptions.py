@@ -25,6 +25,8 @@ from dataclasses import dataclass
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
+import mujoco
+
 
 @dataclass
 class ObjectSpec:
@@ -259,6 +261,13 @@ class ObjectDescriptionBuilder:
         out_path.write_bytes(ET.tostring(root))
         return True
 
+    @staticmethod
+    def _validate_mujoco_xml(xml_path: Path) -> None:
+        try:
+            mujoco.MjModel.from_xml_path(str(xml_path))
+        except Exception as e:
+            raise RuntimeError(f"{xml_path.name}: MuJoCo compile failed: {e}") from e
+
     def build(self, object_ids: set[str] | None, force: bool) -> dict:
         manifest_path = self.dataset_root / "manifest.process_meshes.json"
         if not manifest_path.exists():
@@ -289,6 +298,15 @@ class ObjectDescriptionBuilder:
             else:
                 skipped += 1
 
+        validated = 0
+        for spec in specs:
+            xml_path = spec.obj_dir / f"{spec.object_id}.xml"
+            if not xml_path.exists():
+                raise RuntimeError(f"{spec.object_id}: missing xml after build: {xml_path}")
+            print(f"[MuJoCo validate] {spec.object_id}")
+            self._validate_mujoco_xml(xml_path)
+            validated += 1
+
         return {
             "dataset": self.dataset_root.name,
             "manifest_path": str(manifest_path),
@@ -296,6 +314,7 @@ class ObjectDescriptionBuilder:
             "num_built": built,
             "num_skipped": skipped,
             "num_failed": skipped_non_success,
+            "num_validated_mujoco": validated,
         }
 
 
