@@ -7,7 +7,6 @@ import json
 import os
 import random
 import shutil
-import re
 
 from .base import (
     DEFAULT_MASS_KG,
@@ -26,11 +25,11 @@ from .manifest import IngestManifest
 class ObjaverseAdapter(BaseIngestAdapter):
     source_name = "Objaverse"
     version = "v1"
+    fixed_subset_label = "Daily-Used"
     category_anno_url = (
         "https://virutalbuy-public.oss-cn-hangzhou.aliyuncs.com/share/aigc3d/"
         "category_annotation.json"
     )
-    uid_pattern = re.compile(r"^[0-9a-fA-F-]{16,}$")
 
     def _ensure_category_annotation(self, cache_root: Path) -> Path | None:
         anno_dir = cache_root / "hf-objaverse-v1"
@@ -51,87 +50,29 @@ class ObjaverseAdapter(BaseIngestAdapter):
         except Exception:
             return None
 
-    @staticmethod
-    def _split_subset_tokens(subset: str | None) -> list[str]:
-        if not subset:
-            return []
-        return [x.strip() for x in subset.split(",") if x.strip()]
-
-    @classmethod
-    def _looks_like_uid(cls, value: str) -> bool:
-        return bool(cls.uid_pattern.match(value))
-
-    def _subset_uids_from_file(self, subset: str) -> set[str] | None:
-        candidate = Path(subset).expanduser()
-        if not candidate.exists() or not candidate.is_file():
-            return None
-        with open(candidate, "r", encoding="utf-8") as f:
-            values = {line.strip() for line in f if line.strip()}
-        return {v for v in values if self._looks_like_uid(v)}
-
     def _select_uids(
         self,
         all_uids: set[str],
-        cfg: IngestConfig,
         cache_root: Path,
     ) -> tuple[list[str], list[str]]:
-        """Resolve subset into UID selection.
-
-        Supported subset modes:
-        - None: all uids
-        - comma-separated category labels (requires annotation file)
-        - comma-separated explicit uids
-        - path to a txt file with one uid per line
-        """
         notes: list[str] = []
-        if not cfg.subset:
-            return sorted(all_uids), notes
+        anno_path = self._ensure_category_annotation(cache_root)
+        if anno_path is None:
+            raise RuntimeError("Objaverse download requires category_annotation.json for fixed Daily-Used selection")
 
-        from_file = self._subset_uids_from_file(cfg.subset)
-        if from_file is not None:
-            picked = sorted(from_file.intersection(all_uids))
-            notes.append(
-                f"subset mode=file, requested={len(from_file)}, matched={len(picked)}"
-            )
-            return picked, notes
-
-        subset_tokens = self._split_subset_tokens(cfg.subset)
-        uid_tokens = {x for x in subset_tokens if self._looks_like_uid(x)}
-        category_tokens = {x for x in subset_tokens if x not in uid_tokens}
-
-        picked_uids: set[str] = set()
-        if uid_tokens:
-            picked_uids.update(uid_tokens.intersection(all_uids))
-            notes.append(
-                f"subset mode=uid list, requested={len(uid_tokens)}, matched={len(picked_uids)}"
-            )
-
-        if category_tokens:
-            anno_path = self._ensure_category_annotation(cache_root)
-            if anno_path is None:
-                notes.append(
-                    "subset categories provided but annotation download unavailable; "
-                    "only uid tokens were applied"
-                )
-            else:
-                with open(anno_path, "r", encoding="utf-8") as f:
-                    anno = json.load(f)
-                cat_uids = {
-                    item["object_index"].split(".glb")[0]
-                    for item in anno
-                    if item.get("label") in category_tokens and item.get("object_index")
-                }
-                matched = cat_uids.intersection(all_uids)
-                picked_uids.update(matched)
-                notes.append(
-                    f"subset mode=category, categories={len(category_tokens)}, "
-                    f"matched_uids={len(matched)}"
-                )
-
-        if not picked_uids:
-            notes.append("subset produced 0 objects")
-            return [], notes
-        return sorted(picked_uids), notes
+        with open(anno_path, "r", encoding="utf-8") as f:
+            anno = json.load(f)
+        picked_uids = sorted(
+            {
+                item["object_index"].split(".glb")[0]
+                for item in anno
+                if item.get("label") == self.fixed_subset_label and item.get("object_index")
+            }.intersection(all_uids)
+        )
+        notes.append(
+            f"Objaverse fixed subset={self.fixed_subset_label}, matched_uids={len(picked_uids)}"
+        )
+        return picked_uids, notes
 
     @staticmethod
     def _clean_cache_tmp(cache_root: Path) -> int:
@@ -174,7 +115,7 @@ class ObjaverseAdapter(BaseIngestAdapter):
         os.environ.setdefault("OBJAVERSE_HOME", str(cache_root))
 
         all_uids = set(objaverse.load_uids())
-        uids, subset_notes = self._select_uids(all_uids=all_uids, cfg=cfg, cache_root=cache_root)
+        uids, subset_notes = self._select_uids(all_uids=all_uids, cache_root=cache_root)
         report.notes.extend(subset_notes)
 
         cleaned = self._clean_cache_tmp(cache_root)

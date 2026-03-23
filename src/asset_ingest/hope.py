@@ -30,13 +30,6 @@ class HOPEAdapter(BaseIngestAdapter):
     download_dirname = "hope_objects"
     required_files = {"textured.obj", "textured.mtl", "texture_map.png"}
 
-    @staticmethod
-    def _subset_filter(cfg: IngestConfig) -> set[str] | None:
-        if not cfg.subset:
-            return None
-        values = {x.strip() for x in cfg.subset.split(",") if x.strip()}
-        return values or None
-
     def _list_drive_files(self, out_dir: Path):
         try:
             import gdown  # type: ignore
@@ -67,7 +60,7 @@ class HOPEAdapter(BaseIngestAdapter):
             return None
         return files
 
-    def _download_folder(self, out_dir: Path, subset: set[str] | None = None) -> tuple[Path | None, list[str]]:
+    def _download_folder(self, out_dir: Path) -> tuple[Path | None, list[str]]:
         """Download required HOPE files only and return local root + notes."""
         notes: list[str] = []
         dst_root = out_dir / self.download_dirname
@@ -98,9 +91,6 @@ class HOPEAdapter(BaseIngestAdapter):
             filename = parts[-1]
             if filename not in self.required_files:
                 continue
-            if subset is not None and object_name not in subset:
-                continue
-
             expected_by_object.setdefault(object_name, set()).add(filename)
             tasks.append((object_name, filename, str(file_id), Path(local_path)))
 
@@ -265,7 +255,6 @@ class HOPEAdapter(BaseIngestAdapter):
         out_dir = cfg.source_download_dir
         out_dir.mkdir(parents=True, exist_ok=True)
         report = DownloadReport(source=self.source_name)
-        subset = self._subset_filter(cfg)
 
         source_dir = out_dir / self.download_dirname
         if source_dir.exists() and cfg.force:
@@ -275,7 +264,7 @@ class HOPEAdapter(BaseIngestAdapter):
             report.notes.append(f"skip existing: {relative_to_repo(cfg.repo_root, source_dir)}")
             return report
 
-        downloaded_root, dl_notes = self._download_folder(out_dir, subset=subset)
+        downloaded_root, dl_notes = self._download_folder(out_dir)
         if downloaded_root is None:
             raise RuntimeError(
                 "Failed to download HOPE folder via gdown. "
@@ -303,7 +292,6 @@ class HOPEAdapter(BaseIngestAdapter):
             report.notes.append(f"missing source dir: {source_dir}")
             return report
 
-        subset = self._subset_filter(cfg)
         seen_ids: set[str] = set()
 
         object_dirs = sorted(
@@ -312,9 +300,6 @@ class HOPEAdapter(BaseIngestAdapter):
         iterable = tqdm(object_dirs, desc="HOPE organize", unit="obj") if tqdm is not None else object_dirs
 
         for folder in iterable:
-            if subset is not None and folder.name not in subset:
-                continue
-
             mesh_dir = folder / "google_16k"
             src_obj = mesh_dir / "textured.obj"
             if not src_obj.exists():

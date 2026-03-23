@@ -44,13 +44,6 @@ class DexNetAdapter(BaseIngestAdapter):
     source_dir_env_name = "DEXNET_SOURCE_DIR"
 
     @staticmethod
-    def _subset_filter(cfg: IngestConfig) -> set[str] | None:
-        if not cfg.subset:
-            return None
-        values = {x.strip() for x in cfg.subset.split(",") if x.strip()}
-        return values or None
-
-    @staticmethod
     def _choose_obj(obj_paths: list[Path]) -> Path:
         names = {p.name.lower(): p for p in obj_paths}
         for key in ["textured.obj", "model.obj", "mesh.obj"]:
@@ -175,7 +168,6 @@ class DexNetAdapter(BaseIngestAdapter):
             report.notes.append(f"missing source dir: {src_root}")
             return report
 
-        subset = self._subset_filter(cfg)
         seen_ids: set[str] = set()
 
         candidate_dirs = self._iter_candidate_dirs(src_root)
@@ -185,9 +177,6 @@ class DexNetAdapter(BaseIngestAdapter):
             candidate_iter = candidate_dirs
 
         for folder in candidate_iter:
-            if subset is not None and folder.name not in subset:
-                continue
-
             objs = [x for x in folder.iterdir() if x.is_file() and x.suffix.lower() == ".obj"]
             if not objs:
                 continue

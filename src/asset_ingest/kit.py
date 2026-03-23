@@ -39,13 +39,6 @@ class KITAdapter(BaseIngestAdapter):
     base_url = "https://archive.iar.kit.edu/Projects/ObjectModelsWebUI/"
     list_url = f"{base_url}index.php?section=listAll"
 
-    @staticmethod
-    def _subset_filter(cfg: IngestConfig) -> set[str] | None:
-        if not cfg.subset:
-            return None
-        values = {x.strip() for x in cfg.subset.split(",") if x.strip()}
-        return values or None
-
     def _fetch_archives(self) -> list[_KitArchive]:
         html = urlopen(self.list_url).read().decode("utf-8", "ignore")
         rel_links = re.findall(r'href="(tmp\.php\?[^"]+)"', html)
@@ -112,9 +105,6 @@ class KITAdapter(BaseIngestAdapter):
         report = DownloadReport(source=self.source_name)
 
         archives = self._fetch_archives()
-        subset = self._subset_filter(cfg)
-        if subset is not None:
-            archives = [a for a in archives if a.object_name in subset]
 
         zip_root = out_dir / "archives"
         extract_root = out_dir / "objects"
@@ -190,13 +180,9 @@ class KITAdapter(BaseIngestAdapter):
             report.notes.append(f"missing source dir: {src_root}")
             return report
 
-        subset = self._subset_filter(cfg)
         seen_ids: set[str] = set()
 
         for folder in sorted(p for p in src_root.iterdir() if p.is_dir()):
-            if subset is not None and folder.name not in subset:
-                continue
-
             objs = [x for x in folder.iterdir() if x.is_file() and x.suffix.lower() == ".obj"]
             if not objs:
                 continue

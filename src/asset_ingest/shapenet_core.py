@@ -45,20 +45,6 @@ class ShapeNetCoreAdapter(_ShapeNetHFBaseAdapter):
         return _ShapeNetHFBaseAdapter._truthy_env("SHAPENET_EXPORT_TEXTURES")
 
     @staticmethod
-    def _core_subset_codes(cfg: IngestConfig) -> set[str] | None:
-        subset = _ShapeNetHFBaseAdapter._subset_filter(cfg)
-        if subset is None:
-            return None
-        category_to_code = SHAPENET_CORE_CATEGORIES
-        out: set[str] = set()
-        for x in subset:
-            if x in category_to_code:
-                out.add(category_to_code[x])
-            elif x in category_to_code.values():
-                out.add(x)
-        return out or None
-
-    @staticmethod
     def _find_core_root(snapshot_dir: Path) -> Path | None:
         synset_codes = list(SHAPENET_CORE_CATEGORIES.values())
         stack: list[Path] = [snapshot_dir]
@@ -86,8 +72,6 @@ class ShapeNetCoreAdapter(_ShapeNetHFBaseAdapter):
             return
 
         code_to_category = {v: k for k, v in SHAPENET_CORE_CATEGORIES.items()}
-        subset_codes = self._core_subset_codes(cfg)
-
         def include_member(member: str) -> bool:
             p = PurePosixPath(member)
             parts = p.parts
@@ -99,8 +83,6 @@ class ShapeNetCoreAdapter(_ShapeNetHFBaseAdapter):
                     code = token
                     break
             if code_idx < 0:
-                return False
-            if subset_codes is not None and code not in subset_codes:
                 return False
             if len(parts) <= code_idx + 1:
                 return False
@@ -159,7 +141,6 @@ class ShapeNetCoreAdapter(_ShapeNetHFBaseAdapter):
                 report.notes.append(f"cannot locate extracted ShapeNetCore root under: {snapshot_dir}")
                 return report
 
-        subset_codes = self._core_subset_codes(cfg)
         seen_ids = {p.name for p in processed_dir.iterdir() if p.is_dir()}
         baked_single_texture = 0
         normalized_count = 0
@@ -168,8 +149,6 @@ class ShapeNetCoreAdapter(_ShapeNetHFBaseAdapter):
 
         candidates: list[tuple[str, Path]] = []
         for category, synset_code in SHAPENET_CORE_CATEGORIES.items():
-            if subset_codes is not None and synset_code not in subset_codes:
-                continue
             cat_dir = core_root / synset_code
             if not cat_dir.is_dir():
                 continue

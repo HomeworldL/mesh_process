@@ -45,7 +45,7 @@
   - `python src/ingest_assets.py download --source HOPE`
   - `python src/ingest_assets.py download --source KIT`
   - `python src/ingest_assets.py download --source MSO`
-  - `python src/ingest_assets.py download --source Objaverse --subset Daily-Used`
+  - `python src/ingest_assets.py download --source Objaverse`
   - `python src/ingest_assets.py organize --source Objaverse --sample-n 500 --sample-seed 0`
   - `python src/ingest_assets.py download --source DexNet`
   - `python src/ingest_assets.py organize --source DexNet`
@@ -109,6 +109,7 @@ Build `third_party/CoACD` and `third_party/ACVD` binaries before running `proces
   - texture: `texture_map.png`
   - material: `textured.mtl`
   - `textured.mtl` should reference `texture_map.png` (`map_Kd texture_map.png`).
+  - Stage-1 texture canonicalization assumes single-texture assets for datasets/adapters that copy textures during organize; this is a downstream-oriented canonical export, not a guarantee of lossless preservation of arbitrary multi-material source assets.
   - ShapeNetSem/ShapeNetCore default organize mode is OBJ-only; optional texture export can be enabled by env and is then canonicalized to single `texture_map.png`.
 - Organized object id naming:
   - default convention is `<SourceName>_<object_name>` (sanitize via `sanitize_object_id`).
@@ -119,6 +120,7 @@ Build `third_party/CoACD` and `third_party/ACVD` binaries before running `proces
 - Implement all 3 methods: `download`, `organize`, `build_manifest`.
 - `organize` must call `self.write_manifest_for_organize(cfg, report)` at end.
 - Use `canonicalize_texture_assets(...)` during organize if texture/mtl may exist.
+  - Only use it when the source is known to fit the current single-texture canonical workflow, or when single-texture canonicalization is an explicit acceptable simplification for that dataset.
 - `manifest` path fields must use repo-relative paths via `relative_to_repo(...)`.
 - `has_texture` must follow `.png`-only policy.
 - If source mass is unavailable, follow dataset policy above (`50.0` for normalized datasets; otherwise `0.1`).

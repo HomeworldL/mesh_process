@@ -29,13 +29,6 @@ class _ShapeNetHFBaseAdapter(BaseIngestAdapter):
     normalized_default_mass_kg: float = 50.0
 
     @staticmethod
-    def _subset_filter(cfg: IngestConfig) -> set[str] | None:
-        if not cfg.subset:
-            return None
-        vals = {x.strip() for x in cfg.subset.split(",") if x.strip()}
-        return vals or None
-
-    @staticmethod
     def _truthy_env(name: str) -> bool:
         v = os.environ.get(name, "").strip().lower()
         return v in {"1", "true", "yes", "on"}

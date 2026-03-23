@@ -115,14 +115,8 @@ class YCBAdapter(BaseIngestAdapter):
         report = DownloadReport(source=self.source_name)
 
         objects = self._fetch_objects()
-        subset = None
-        if cfg.subset:
-            subset = {x.strip() for x in cfg.subset.split(",") if x.strip()}
-
         tasks: list[tuple[str, str]] = []
         for obj_name in objects:
-            if subset is not None and obj_name not in subset:
-                continue
             for file_type in self.files_to_download:
                 tasks.append((obj_name, file_type))
 

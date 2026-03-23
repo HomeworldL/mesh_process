@@ -12,19 +12,50 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from asset_ingest.base import BaseIngestAdapter
+from asset_ingest.base import IngestConfig
 from asset_ingest.manifest import IngestManifest
 from asset_ingest.registry import ADAPTERS, get_adapter
 
 
-def parse_args() -> argparse.Namespace:
-    common = BaseIngestAdapter.parse_common_args()
+def config_from_args(args: argparse.Namespace, source_name: str) -> IngestConfig:
+    repo_root = Path(args.repo_root).resolve()
+    raw_root = (
+        Path(args.raw_root).resolve()
+        if args.raw_root is not None
+        else repo_root / "assets" / "objects" / "raw"
+    )
+    processed_root = (
+        Path(args.processed_root).resolve()
+        if args.processed_root is not None
+        else repo_root / "assets" / "objects" / "processed"
+    )
+    return IngestConfig(
+        repo_root=repo_root,
+        source_name=source_name,
+        raw_root=raw_root,
+        processed_root=processed_root,
+        force=bool(args.force),
+        workers=int(args.workers),
+        sample_n=getattr(args, "sample_n", None),
+        sample_seed=int(getattr(args, "sample_seed", 0)),
+    )
 
+
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Object source ingest CLI")
     sub = parser.add_subparsers(dest="command", required=True)
 
     for name in ["download", "organize", "verify"]:
-        p = sub.add_parser(name, parents=[common])
+        p = sub.add_parser(name)
+        p.add_argument("--force", action="store_true")
+        p.add_argument("--workers", type=int, default=8)
+        p.add_argument(
+            "--repo-root",
+            type=Path,
+            default=Path(__file__).resolve().parents[1],
+        )
+        p.add_argument("--raw-root", type=Path, default=None)
+        p.add_argument("--processed-root", type=Path, default=None)
         p.add_argument("--source", type=str, required=True, choices=sorted(ADAPTERS.keys()))
         if name == "organize":
             p.add_argument(
@@ -52,7 +83,7 @@ def manifest_path(cfg) -> Path:
 def main() -> None:
     args = parse_args()
     adapter = get_adapter(args.source)
-    cfg = adapter.config_from_args(args, source_name=args.source)
+    cfg = config_from_args(args, source_name=args.source)
 
     if args.command == "download":
         print(adapter.download(cfg))

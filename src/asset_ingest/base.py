@@ -6,7 +6,6 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
-import argparse
 import math
 import os
 import re
@@ -40,12 +39,10 @@ CANONICAL_TEXTURE_NAME = "texture_map.png"
 class IngestConfig:
     repo_root: Path
     source_name: str
-    download_root: Path
     raw_root: Path
     processed_root: Path
     force: bool = False
     workers: int = 8
-    subset: str | None = None
     sample_n: int | None = None
     sample_seed: int = 0
     credentials: dict[str, Any] = field(default_factory=dict)
@@ -569,65 +566,6 @@ class BaseIngestAdapter(ABC):
         else:
             report.notes.append("manifest validation passed")
         self.append_bbox_stats_for_dataset(cfg, report)
-
-    @staticmethod
-    def parse_common_args() -> argparse.ArgumentParser:
-        """
-        EN: Define common CLI arguments shared by all ingest adapters.
-        ZH: 定义所有 ingest adapter 共用的命令行参数。
-
-        Used by / 用于: `src/ingest_assets.py`.
-        """
-        parser = argparse.ArgumentParser(add_help=False)
-        parser.add_argument("--force", action="store_true")
-        parser.add_argument("--workers", type=int, default=8)
-        parser.add_argument("--subset", type=str, default=None)
-        parser.add_argument(
-            "--repo-root", type=Path, default=Path(__file__).resolve().parents[2]
-        )
-        parser.add_argument("--download-root", type=Path, default=None)
-        parser.add_argument("--raw-root", type=Path, default=None)
-        parser.add_argument("--processed-root", type=Path, default=None)
-        return parser
-
-    @classmethod
-    def config_from_args(cls, args: argparse.Namespace, source_name: str) -> IngestConfig:
-        """
-        EN: Convert parsed CLI args into the normalized ingest config object.
-        ZH: 将命令行参数整理成统一的 `IngestConfig` 配置对象。
-
-        Used by / 用于: `src/ingest_assets.py` for all adapters.
-        """
-        repo_root = Path(args.repo_root).resolve()
-        raw_root = (
-            Path(args.raw_root).resolve()
-            if args.raw_root is not None
-            else repo_root / "assets" / "objects" / "raw"
-        )
-        # Keep argument for compatibility, but raw is the effective download root now.
-        download_root = (
-            Path(args.download_root).resolve()
-            if args.download_root is not None
-            else raw_root
-        )
-        processed_root = (
-            Path(args.processed_root).resolve()
-            if args.processed_root is not None
-            else repo_root / "assets" / "objects" / "processed"
-        )
-        return IngestConfig(
-            repo_root=repo_root,
-            source_name=source_name,
-            download_root=download_root,
-            raw_root=raw_root,
-            processed_root=processed_root,
-            force=bool(args.force),
-            workers=int(args.workers),
-            subset=args.subset,
-            sample_n=getattr(args, "sample_n", None),
-            sample_seed=int(getattr(args, "sample_seed", 0)),
-        )
-
 
 def sanitize_object_id(name: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", name.strip())

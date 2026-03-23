@@ -240,7 +240,6 @@ class ShapeNetSemAdapter(_ShapeNetHFBaseAdapter):
         rows = self._read_sem_metadata(metadata_csv)
         selected_instances = self._select_sem_instances(rows)
 
-        subset = self._subset_filter(cfg)
         seen_ids = {p.name for p in processed_dir.iterdir() if p.is_dir()}
 
         obj_root = sem_root / "models-OBJ" / "models"
@@ -263,9 +262,6 @@ class ShapeNetSemAdapter(_ShapeNetHFBaseAdapter):
         normalized_count = 0
         dropped_bad_scale = 0
         for instance_id, category in iterable:
-            if subset is not None and category not in subset:
-                continue
-
             src_obj = obj_root / f"{instance_id}.obj"
             src_mtl = obj_root / f"{instance_id}.mtl"
 
