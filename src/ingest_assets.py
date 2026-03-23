@@ -12,7 +12,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from asset_ingest.base import IngestConfig
+from asset_ingest.base import DownloadReport, IngestConfig, OrganizeReport
 from asset_ingest.manifest import IngestManifest
 from asset_ingest.registry import ADAPTERS, get_adapter
 
@@ -80,18 +80,53 @@ def manifest_path(cfg) -> Path:
     return cfg.source_processed_dir / "manifest.json"
 
 
+def _print_list_block(title: str, values: list[str], *, max_items: int | None = None) -> None:
+    print(f"{title}:")
+    if not values:
+        print("- none")
+        return
+
+    shown = values if max_items is None else values[:max_items]
+    for value in shown:
+        print(f"- {value}")
+    remaining = len(values) - len(shown)
+    if remaining > 0:
+        print(f"- ... ({remaining} more)")
+
+
+def print_download_report(report: DownloadReport) -> None:
+    print(f"Source: {report.source}")
+    print(f"Downloaded files: {len(report.downloaded_files)}")
+    _print_list_block("Download outputs", report.downloaded_files)
+    _print_list_block("Notes", report.notes)
+
+
+def print_organize_report(report: OrganizeReport) -> None:
+    print(f"Source: {report.source}")
+    print(f"Organized objects: {report.organized_objects}")
+    print(f"Failed items: {len(report.failed_items)}")
+    print(f"Manifest: {report.manifest_path or 'none'}")
+    print(f"Manifest errors: {len(report.manifest_errors)}")
+
+    if report.failed_items:
+        _print_list_block("Failed item preview", report.failed_items, max_items=20)
+    if report.manifest_errors:
+        _print_list_block("Manifest error preview", report.manifest_errors, max_items=20)
+    _print_list_block("Notes", report.notes)
+
+
 def main() -> None:
     args = parse_args()
     adapter = get_adapter(args.source)
     cfg = config_from_args(args, source_name=args.source)
 
     if args.command == "download":
-        print(adapter.download(cfg))
+        print_download_report(adapter.download(cfg))
         return
 
     if args.command == "organize":
         report = adapter.organize(cfg)
-        print(report)
+        print_organize_report(report)
         return
 
     if args.command == "verify":

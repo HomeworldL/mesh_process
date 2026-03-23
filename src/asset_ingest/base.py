@@ -260,6 +260,150 @@ class BaseIngestAdapter(ABC):
         return manifest
 
     @staticmethod
+    def _resolve_obj_vertex_index(vertex_token: str, vertex_count: int) -> int | None:
+        """
+        EN: Resolve one OBJ face vertex token to a 1-based vertex index.
+        ZH: 将一个 OBJ face 顶点 token 解析为 1-based 顶点索引。
+
+        Used by / 用于: normalized OBJ export and face rewriting helpers.
+        """
+        token = vertex_token.strip()
+        if not token:
+            return None
+        try:
+            raw_index = int(token)
+        except Exception:
+            return None
+
+        if raw_index > 0:
+            resolved = raw_index
+        else:
+            resolved = vertex_count + raw_index + 1
+        if not (1 <= resolved <= vertex_count):
+            return None
+        return resolved
+
+    @staticmethod
+    def _resolve_obj_face_vertex_index(
+        vertex_token: str,
+        *,
+        current_vertex_count: int,
+        total_vertex_count: int,
+    ) -> int | None:
+        """
+        EN: Resolve OBJ face vertex index with support for positive and negative indices.
+        ZH: 解析 OBJ face 顶点索引，兼容正索引和负索引。
+
+        Used by / 用于: normalized OBJ export and face rewriting helpers.
+        """
+        token = vertex_token.strip()
+        if not token:
+            return None
+        try:
+            raw_index = int(token)
+        except Exception:
+            return None
+
+        if raw_index > 0:
+            if 1 <= raw_index <= total_vertex_count:
+                return raw_index
+            return None
+        return BaseIngestAdapter._resolve_obj_vertex_index(token, current_vertex_count)
+
+    @staticmethod
+    def _parse_obj_vertex_xyz(line: str) -> tuple[float, float, float] | None:
+        """
+        EN: Parse one OBJ `v` record into xyz floats.
+        ZH: 将一行 OBJ `v` 记录解析为 xyz 浮点坐标。
+
+        Used by / 用于: normalized OBJ export and bbox helpers.
+        """
+        toks = line.lstrip().split()
+        if not toks or toks[0] != "v" or len(toks) < 4:
+            return None
+        try:
+            xyz = (float(toks[1]), float(toks[2]), float(toks[3]))
+        except Exception:
+            return None
+        if not all(math.isfinite(v) for v in xyz):
+            return None
+        return xyz
+
+    @staticmethod
+    def _resolve_used_vertex_indices(lines: list[str]) -> tuple[set[int], int]:
+        """
+        EN: Return 1-based OBJ vertex indices referenced by any face record.
+        ZH: 返回被任意 `f` 面记录引用到的 OBJ 顶点索引（1-based）。
+
+        Used by / 用于: normalized OBJ export to drop unreferenced vertices.
+        """
+        vertex_count = 0
+        used_indices: set[int] = set()
+
+        for line in lines:
+            stripped = line.lstrip()
+            toks = stripped.split()
+            if not toks:
+                continue
+            if toks[0] == "v" and len(toks) >= 4:
+                vertex_count += 1
+        current_vertex_count = 0
+        for line in lines:
+            stripped = line.lstrip()
+            toks = stripped.split()
+            if not toks:
+                continue
+            if toks[0] == "v" and len(toks) >= 4:
+                current_vertex_count += 1
+                continue
+            if toks[0] != "f" or len(toks) < 4:
+                continue
+            for face_token in toks[1:]:
+                vertex_token = face_token.split("/", 1)[0]
+                resolved = BaseIngestAdapter._resolve_obj_face_vertex_index(
+                    vertex_token,
+                    current_vertex_count=current_vertex_count,
+                    total_vertex_count=vertex_count,
+                )
+                if resolved is not None:
+                    used_indices.add(resolved)
+        return used_indices, vertex_count
+
+    @staticmethod
+    def _rewrite_face_vertex_indices(
+        face_tokens: list[str],
+        vertex_index_map: dict[int, int],
+        *,
+        current_vertex_count: int,
+        total_vertex_count: int,
+    ) -> list[str] | None:
+        """
+        EN: Rewrite face tokens with remapped OBJ vertex indices.
+        ZH: 用新的 OBJ 顶点索引重写一行 `f` 的各个 face token。
+
+        Used by / 用于: normalized OBJ export after dropping unreferenced vertices.
+        """
+        rewritten: list[str] = []
+        for face_token in face_tokens:
+            if not face_token:
+                return None
+            parts = face_token.split("/")
+            resolved = BaseIngestAdapter._resolve_obj_face_vertex_index(
+                parts[0],
+                current_vertex_count=current_vertex_count,
+                total_vertex_count=total_vertex_count,
+            )
+            if resolved is None:
+                return None
+            mapped = vertex_index_map.get(resolved)
+            if mapped is None:
+                return None
+
+            parts[0] = str(mapped)
+            rewritten.append("/".join(parts))
+        return rewritten
+
+    @staticmethod
     def normalize_obj_center_and_scale(
         src_obj_path: Path,
         dst_obj_path: Path,
@@ -280,31 +424,35 @@ class BaseIngestAdapter(ABC):
         """
         metrics: dict[str, float] = {}
         try:
-            import trimesh  # type: ignore
+            lines = src_obj_path.read_text(encoding="utf-8", errors="ignore").splitlines()
         except Exception as e:
-            return False, f"trimesh unavailable: {e}", metrics
+            return False, f"failed reading obj text: {e}", metrics
 
-        try:
-            loaded = trimesh.load(
-                str(src_obj_path),
-                force="mesh",
-                process=False,
-                maintain_order=True,
-            )
-        except Exception as e:
-            return False, f"failed to load obj: {e}", metrics
+        used_vertex_indices, total_vertex_count = BaseIngestAdapter._resolve_used_vertex_indices(lines)
+        if total_vertex_count == 0:
+            return False, "no valid 'v' records found in obj text", metrics
+        if not used_vertex_indices:
+            return False, "no valid face-referenced vertices found in obj text", metrics
 
-        if not isinstance(loaded, trimesh.Trimesh) or loaded.vertices is None or len(loaded.vertices) == 0:
-            return False, "loaded object has no valid mesh vertices", metrics
+        min_xyz = [math.inf, math.inf, math.inf]
+        max_xyz = [-math.inf, -math.inf, -math.inf]
+        for current_vertex_index, line in enumerate(
+            (line for line in lines if line.lstrip().split()[:1] == ["v"]),
+            start=1,
+        ):
+            if current_vertex_index not in used_vertex_indices:
+                continue
+            xyz = BaseIngestAdapter._parse_obj_vertex_xyz(line)
+            if xyz is None:
+                return False, f"failed parsing referenced vertex #{current_vertex_index}", metrics
+            for axis, value in enumerate(xyz):
+                min_xyz[axis] = min(min_xyz[axis], value)
+                max_xyz[axis] = max(max_xyz[axis], value)
 
-        bounds = loaded.bounds
-        if bounds is None or len(bounds) != 2:
-            return False, "loaded object has invalid bounds", metrics
+        if not all(math.isfinite(v) for v in min_xyz + max_xyz):
+            return False, "referenced vertices have invalid bounds", metrics
 
-        extent = bounds[1] - bounds[0]
-        if not all(math.isfinite(float(x)) for x in extent):
-            return False, "non-finite bounds extent", metrics
-
+        extent = [max_xyz[i] - min_xyz[i] for i in range(3)]
         pre_max_extent = float(max(extent))
         pre_min_extent = float(min(extent))
         pre_aspect_ratio = float(pre_max_extent / max(pre_min_extent, min_extent_eps))
@@ -324,54 +472,70 @@ class BaseIngestAdapter(ABC):
                 metrics,
             )
 
-        center = (bounds[0] + bounds[1]) * 0.5
+        center = [
+            (min_xyz[0] + max_xyz[0]) * 0.5,
+            (min_xyz[1] + max_xyz[1]) * 0.5,
+            (min_xyz[2] + max_xyz[2]) * 0.5,
+        ]
         scale = float(target_max_extent / pre_max_extent)
 
-        try:
-            lines = src_obj_path.read_text(encoding="utf-8", errors="ignore").splitlines()
-        except Exception as e:
-            return False, f"failed reading obj text: {e}", metrics
-
-        out_lines = list(lines)
-        vertex_count = 0
-        for idx, line in enumerate(lines):
+        kept_vertex_count = 0
+        vertex_index_map = {
+            old_index: new_index
+            for new_index, old_index in enumerate(sorted(used_vertex_indices), start=1)
+        }
+        kept_vertex_count = len(vertex_index_map)
+        out_lines: list[str] = []
+        current_vertex_count = 0
+        for line in lines:
             stripped = line.lstrip()
             toks = stripped.split()
-            if not toks or toks[0] != "v" or len(toks) < 4:
+            if toks and toks[0] == "v" and len(toks) >= 4:
+                current_vertex_count += 1
+                if current_vertex_count not in used_vertex_indices:
+                    continue
+                xyz = BaseIngestAdapter._parse_obj_vertex_xyz(line)
+                if xyz is None:
+                    return False, f"failed parsing referenced vertex #{current_vertex_count}", metrics
+                vx = (xyz[0] - center[0]) * scale
+                vy = (xyz[1] - center[1]) * scale
+                vz = (xyz[2] - center[2]) * scale
+                out_lines.append(f"v {vx:.9f} {vy:.9f} {vz:.9f}")
                 continue
-            try:
-                vx = (float(toks[1]) - float(center[0])) * scale
-                vy = (float(toks[2]) - float(center[1])) * scale
-                vz = (float(toks[3]) - float(center[2])) * scale
-            except Exception:
-                continue
-            out_lines[idx] = f"v {vx:.9f} {vy:.9f} {vz:.9f}"
-            vertex_count += 1
 
-        if vertex_count == 0:
-            return False, "no valid 'v' records found in obj text", metrics
+            if toks and toks[0] == "f" and len(toks) >= 4:
+                rewritten = BaseIngestAdapter._rewrite_face_vertex_indices(
+                    toks[1:],
+                    vertex_index_map=vertex_index_map,
+                    current_vertex_count=current_vertex_count,
+                    total_vertex_count=total_vertex_count,
+                )
+                if rewritten is None:
+                    return False, "failed to rewrite face indices during normalization", metrics
+                out_lines.append("f " + " ".join(rewritten))
+                continue
+
+            out_lines.append(line)
+
+        if kept_vertex_count == 0:
+            return False, "no valid face-referenced 'v' records found in obj text", metrics
+
+        metrics["kept_vertex_count"] = float(kept_vertex_count)
+        metrics["dropped_unreferenced_vertices"] = float(total_vertex_count - kept_vertex_count)
 
         dst_obj_path.parent.mkdir(parents=True, exist_ok=True)
         dst_obj_path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
 
-        try:
-            post_mesh = trimesh.load(
-                str(dst_obj_path),
-                force="mesh",
-                process=False,
-                maintain_order=True,
-            )
-        except Exception as e:
-            return False, f"failed to reload normalized obj: {e}", metrics
+        post_metrics = BaseIngestAdapter._read_obj_bbox_metrics(dst_obj_path)
+        if post_metrics is None:
+            return False, "normalized obj has invalid bbox metrics", metrics
 
-        if not isinstance(post_mesh, trimesh.Trimesh) or post_mesh.bounds is None:
-            return False, "normalized obj has invalid bounds", metrics
-
-        post_extent = post_mesh.bounds[1] - post_mesh.bounds[0]
-        if not all(math.isfinite(float(x)) for x in post_extent):
-            return False, "normalized obj extent is non-finite", metrics
-        post_max_extent = float(max(post_extent))
-        post_center = (post_mesh.bounds[0] + post_mesh.bounds[1]) * 0.5
+        post_max_extent = float(post_metrics["max_extent"])
+        post_center = [
+            (post_metrics["min_x"] + post_metrics["max_x"]) * 0.5,
+            (post_metrics["min_y"] + post_metrics["max_y"]) * 0.5,
+            (post_metrics["min_z"] + post_metrics["max_z"]) * 0.5,
+        ]
         post_center_norm = float(
             math.sqrt(
                 float(post_center[0]) ** 2
@@ -418,17 +582,10 @@ class BaseIngestAdapter(ABC):
         try:
             with obj_path.open("r", encoding="utf-8", errors="ignore") as f:
                 for line in f:
-                    stripped = line.lstrip()
-                    toks = stripped.split()
-                    if not toks or toks[0] != "v" or len(toks) < 4:
+                    xyz = BaseIngestAdapter._parse_obj_vertex_xyz(line)
+                    if xyz is None:
                         continue
-                    try:
-                        vals = [float(toks[1]), float(toks[2]), float(toks[3])]
-                    except Exception:
-                        continue
-                    if not all(math.isfinite(v) for v in vals):
-                        continue
-                    for axis, value in enumerate(vals):
+                    for axis, value in enumerate(xyz):
                         min_xyz[axis] = min(min_xyz[axis], value)
                         max_xyz[axis] = max(max_xyz[axis], value)
                     vertex_count += 1
@@ -443,6 +600,12 @@ class BaseIngestAdapter(ABC):
             return None
 
         return {
+            "min_x": float(min_xyz[0]),
+            "min_y": float(min_xyz[1]),
+            "min_z": float(min_xyz[2]),
+            "max_x": float(max_xyz[0]),
+            "max_y": float(max_xyz[1]),
+            "max_z": float(max_xyz[2]),
             "extent_x": float(extents[0]),
             "extent_y": float(extents[1]),
             "extent_z": float(extents[2]),

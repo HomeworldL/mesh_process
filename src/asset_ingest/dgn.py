@@ -203,8 +203,10 @@ class DGNAdapter(BaseIngestAdapter):
                     ddg_count += 1
 
         # Keep ingest CLI compatibility: DGN source manifest at processed/DGN/manifest.json
+        print("[DGN] Writing DGN manifest and scanning DGN bbox stats...")
         self.write_manifest_for_organize(cfg, report)
         # Also emit derived DDG manifest to make downstream pipeline consistent.
+        print("[DGN] Writing DDG manifest...")
         ddg_manifest = self._build_manifest_for_dataset(cfg, "DDG")
         ddg_manifest_path = cfg.processed_root / "DDG" / "manifest.json"
         ddg_manifest.save(ddg_manifest_path)
@@ -220,6 +222,7 @@ class DGNAdapter(BaseIngestAdapter):
         report.notes.append(f"DGN objects (full set): {dgn_count}")
         report.notes.append(f"DDG objects (subset, prefix ddg*): {ddg_count}")
         report.notes.append(f"DDG manifest: {relative_to_repo(cfg.repo_root, ddg_manifest_path)}")
+        print("[DGN] Scanning DDG bbox stats...")
         self.append_bbox_stats_for_dataset(
             cfg,
             report,
