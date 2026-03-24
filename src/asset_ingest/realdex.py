@@ -45,8 +45,7 @@ class RealDexAdapter(BaseIngestAdapter):
 
         return report
 
-    @staticmethod
-    def _resolve_models_root(extract_root: Path) -> Path:
+    def _resolve_models_root(self, extract_root: Path) -> Path:
         # Expected RealDex layout:
         # assets/objects/raw/RealDex/RealDex-objmodels/models/*.obj
         direct = extract_root / "models"
@@ -93,12 +92,27 @@ class RealDexAdapter(BaseIngestAdapter):
             if dst_obj.exists() and not cfg.force:
                 continue
 
-            # RealDex object models are white-mesh OBJ files without texture.
-            # Keep only a normalized object mesh path in raw.
-            shutil.copy2(src_obj, dst_obj)
+            ok_load, load_reason, mesh = self.load_obj_mesh(
+                src_obj,
+                remove_unreferenced_vertices=True,
+            )
+            if not ok_load or mesh is None:
+                report.failed_items.append(f"load failed for {object_id}: {load_reason}")
+                shutil.rmtree(dst_dir, ignore_errors=True)
+                continue
+            try:
+                self.export_trimesh_obj_assets(
+                    mesh,
+                    dst_dir,
+                    export_texture=False,
+                )
+            except Exception as exc:
+                report.failed_items.append(f"export failed for {object_id}: {exc}")
+                shutil.rmtree(dst_dir, ignore_errors=True)
+                continue
             report.organized_objects += 1
 
-        report.notes.append("RealDex organize mode: OBJ-only (no texture assets copied)")
+        report.notes.append("RealDex organize mode: trimesh OBJ-only export (no texture assets)")
         self.write_manifest_for_organize(cfg, report)
         return report
 

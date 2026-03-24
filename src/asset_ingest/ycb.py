@@ -9,13 +9,11 @@ import tarfile
 from urllib.request import Request, urlopen
 
 from .base import (
-    CANONICAL_MTL_NAME,
     DEFAULT_MASS_KG,
     BaseIngestAdapter,
     DownloadReport,
     IngestConfig,
     OrganizeReport,
-    canonicalize_texture_assets,
     relative_to_repo,
     sanitize_object_id,
     tqdm,
@@ -31,14 +29,18 @@ class YCBAdapter(BaseIngestAdapter):
     base_url = "http://ycb-benchmarks.s3-website-us-east-1.amazonaws.com/data/"
     files_to_download = ["berkeley_processed", "google_16k"]
 
-    @staticmethod
-    def _choose_source_mesh_dir(obj_dir: Path) -> tuple[Path, bool] | None:
-        # If google_16k exists, treat object as textured-capable.
+    def _choose_source_mesh_dir(self, obj_dir: Path) -> tuple[Path, bool] | None:
+        # EN: Prefer google_16k when present; only that branch is treated as
+        # textured export in stage-1. Other branches still contribute geometry,
+        # but we intentionally do not export texture sidecars from them.
+        # ZH: 优先使用 google_16k；只有这一路在一阶段会导出纹理文件。
+        # 其他分支仍可提供几何，但我们有意不从中导出纹理 sidecar。
         google_dir = obj_dir / "google_16k"
         if google_dir.is_dir() and (google_dir / "textured.obj").is_file():
             return google_dir, True
 
-        # Fallback for objects without google_16k: only keep mesh.
+        # EN: Fallback for objects without google_16k: keep mesh only.
+        # ZH: 对没有 google_16k 的对象回退到 poisson，但只保留几何网格。
         poisson_dir = obj_dir / "poisson"
         if poisson_dir.is_dir() and (poisson_dir / "textured.obj").is_file():
             return poisson_dir, False
@@ -59,8 +61,7 @@ class YCBAdapter(BaseIngestAdapter):
             return f"{self.base_url}berkeley/{obj_name}/{obj_name}_berkeley_meshes.tgz"
         return f"{self.base_url}google/{obj_name}_{file_type}.tgz"
 
-    @staticmethod
-    def _check_url(url: str) -> bool:
+    def _check_url(self, url: str) -> bool:
         try:
             request = Request(url)
             request.get_method = lambda: "HEAD"
@@ -69,8 +70,7 @@ class YCBAdapter(BaseIngestAdapter):
         except Exception:
             return False
 
-    @staticmethod
-    def _download_file(url: str, filename: Path) -> int:
+    def _download_file(self, url: str, filename: Path) -> int:
         req = urlopen(url)
         tmp = filename.with_suffix(filename.suffix + ".part")
         if tmp.exists():
@@ -99,8 +99,7 @@ class YCBAdapter(BaseIngestAdapter):
             raw = json.load(f)
         return {str(k): float(v) for k, v in raw.items()}
 
-    @staticmethod
-    def _resolve_mass(mass_map: dict[str, float], object_id: str) -> float:
+    def _resolve_mass(self, mass_map: dict[str, float], object_id: str) -> float:
         if object_id in mass_map:
             return float(mass_map[object_id])
         if "_" in object_id:
@@ -184,40 +183,68 @@ class YCBAdapter(BaseIngestAdapter):
             report.notes.append(f"missing download dir: {src_dir}")
             return report
 
-        for obj_dir in sorted(p for p in src_dir.iterdir() if p.is_dir()):
-            pick = self._choose_source_mesh_dir(obj_dir)
-            if pick is None:
-                continue
-            mesh_dir, has_google_texture = pick
+        obj_dirs = sorted(p for p in src_dir.iterdir() if p.is_dir())
+        bar = tqdm(total=len(obj_dirs), desc="YCB organize", unit="obj") if tqdm is not None else None
+        for obj_dir in obj_dirs:
+            try:
+                pick = self._choose_source_mesh_dir(obj_dir)
+                if pick is None:
+                    continue
+                mesh_dir, has_google_texture = pick
 
-            obj_name = sanitize_object_id(f"{self.source_name}_{obj_dir.name}")
-            dst_dir = processed_dir / obj_name
-            if dst_dir.exists() and cfg.force:
-                shutil.rmtree(dst_dir)
-            dst_dir.mkdir(parents=True, exist_ok=True)
+                obj_name = sanitize_object_id(f"{self.source_name}_{obj_dir.name}")
+                dst_dir = processed_dir / obj_name
+                if dst_dir.exists() and cfg.force:
+                    shutil.rmtree(dst_dir)
+                dst_dir.mkdir(parents=True, exist_ok=True)
 
-            dst_obj = dst_dir / "raw.obj"
-            if dst_obj.exists() and not cfg.force:
-                continue
+                dst_obj = dst_dir / "raw.obj"
+                if dst_obj.exists() and not cfg.force:
+                    continue
 
-            src_obj = mesh_dir / "textured.obj"
-            if not src_obj.exists():
-                report.failed_items.append(f"missing textured.obj for {obj_name}")
-                continue
+                src_obj = mesh_dir / "textured.obj"
+                if not src_obj.exists():
+                    report.failed_items.append(f"missing textured.obj for {obj_name}")
+                    continue
 
-            shutil.copy2(src_obj, dst_obj)
-            if has_google_texture:
-                mtl_src = mesh_dir / "textured.mtl"
-                tex_src = mesh_dir / "texture_map.png"
-                canonicalize_texture_assets(
-                    dst_dir=dst_dir,
-                    raw_obj_path=dst_obj,
-                    texture_src=(tex_src if tex_src.exists() else None),
-                    mtl_src=(mtl_src if mtl_src.exists() else None),
-                    create_mtl_if_texture=False,
+                # EN: Always re-load the source mesh with trimesh so YCB organize
+                # follows the same stage-1 export style as normalized datasets.
+                # ZH: 始终先用 trimesh 重新加载源 mesh，这样 YCB 的 organize
+                # 与归一化数据集共享同一套一阶段导出风格。
+                # EN: Keep google_16k textured meshes as intact as possible and
+                # avoid reindexing through unreferenced-vertex cleanup there.
+                # For non-textured fallback branches, cleanup is still fine.
+                # ZH: 对 google_16k 纹理网格尽量保持原始索引结构，不做未引用顶点清理；
+                # 对无纹理回退分支则仍允许清理。
+                ok_load, load_reason, mesh = self.load_obj_mesh(
+                    src_obj,
+                    remove_unreferenced_vertices=(not has_google_texture),
                 )
+                if not ok_load or mesh is None:
+                    report.failed_items.append(f"load failed for {obj_name}: {load_reason}")
+                    continue
 
-            report.organized_objects += 1
+                try:
+                    # EN: Texture export is gated only by whether this object came
+                    # from google_16k. This avoids exporting poisson's tiny fallback
+                    # texture placeholders as real stage-1 textures.
+                    # ZH: 是否导出纹理仅取决于对象是否来自 google_16k，
+                    # 这样可以避免把 poisson 分支里的极小占位贴图当成真实纹理导出。
+                    self.export_trimesh_obj_assets(
+                        mesh,
+                        dst_dir,
+                        export_texture=has_google_texture,
+                    )
+                except Exception as exc:
+                    report.failed_items.append(f"export failed for {obj_name}: {exc}")
+                    continue
+
+                report.organized_objects += 1
+            finally:
+                if bar is not None:
+                    bar.update(1)
+        if bar is not None:
+            bar.close()
 
         self.write_manifest_for_organize(cfg, report)
         return report

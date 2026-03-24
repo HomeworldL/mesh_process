@@ -8,13 +8,14 @@ import os
 import random
 import shutil
 
+import trimesh
+
 from .base import (
     DEFAULT_MASS_KG,
     BaseIngestAdapter,
     DownloadReport,
     IngestConfig,
     OrganizeReport,
-    canonicalize_texture_assets,
     relative_to_repo,
     sanitize_object_id,
     tqdm,
@@ -74,8 +75,7 @@ class ObjaverseAdapter(BaseIngestAdapter):
         )
         return picked_uids, notes
 
-    @staticmethod
-    def _clean_cache_tmp(cache_root: Path) -> int:
+    def _clean_cache_tmp(self, cache_root: Path) -> int:
         cleaned = 0
         glb_dir = cache_root / "hf-objaverse-v1" / "glbs"
         if not glb_dir.exists():
@@ -85,8 +85,7 @@ class ObjaverseAdapter(BaseIngestAdapter):
             cleaned += 1
         return cleaned
 
-    @staticmethod
-    def _link_or_copy(src_path: Path, dst_path: Path) -> str:
+    def _link_or_copy(self, src_path: Path, dst_path: Path) -> str:
         if dst_path.exists() or dst_path.is_symlink():
             dst_path.unlink()
         try:
@@ -185,11 +184,6 @@ class ObjaverseAdapter(BaseIngestAdapter):
             report.notes.append(f"missing Objaverse objects dir: {src_dir}")
             return report
 
-        try:
-            import trimesh
-        except Exception as exc:
-            raise RuntimeError("Objaverse organize requires `trimesh`: pip install trimesh") from exc
-
         mesh_paths = sorted(
             p for p in src_dir.rglob("*") if p.is_file() and p.suffix.lower() in {".glb", ".gltf", ".obj"}
         )
@@ -226,42 +220,23 @@ class ObjaverseAdapter(BaseIngestAdapter):
                 continue
 
             try:
-                if mesh_path.suffix.lower() == ".obj":
-                    shutil.copy2(mesh_path, out_obj)
-                    mtl_src = next((p for p in sorted(mesh_path.parent.glob("*.mtl")) if p.is_file()), None)
-                    tex_src = next((p for p in sorted(mesh_path.parent.glob("*.png")) if p.is_file()), None)
-                    canonicalize_texture_assets(
-                        dst_dir=out_dir,
-                        raw_obj_path=out_obj,
-                        texture_src=tex_src,
-                        mtl_src=mtl_src,
-                        create_mtl_if_texture=False,
-                    )
-                else:
-                    loaded = trimesh.load(mesh_path, process=False, force="scene")
-                    if isinstance(loaded, trimesh.Trimesh):
-                        loaded.export(out_obj)
-                    else:
-                        if not loaded.geometry:
-                            report.failed_items.append(f"empty scene: {mesh_path.name}")
-                            continue
-                        # Prefer scene export first (better chance to keep materials/textures).
-                        try:
-                            loaded.export(out_obj)
-                        except Exception:
-                            mesh = trimesh.util.concatenate(tuple(loaded.geometry.values()))
-                            mesh.export(out_obj)
-
-                    # Normalize optional texture assets generated during GLB/GLTF export.
-                    mtl_src = next((p for p in sorted(out_dir.glob("*.mtl")) if p.is_file()), None)
-                    tex_src = next((p for p in sorted(out_dir.glob("*.png")) if p.is_file()), None)
-                    canonicalize_texture_assets(
-                        dst_dir=out_dir,
-                        raw_obj_path=out_obj,
-                        texture_src=tex_src,
-                        mtl_src=mtl_src,
-                        create_mtl_if_texture=False,
-                    )
+                ok_load, load_reason, mesh = self.load_obj_mesh(
+                    mesh_path,
+                    remove_unreferenced_vertices=False,
+                )
+                if not ok_load or mesh is None:
+                    report.failed_items.append(f"{mesh_path.name}: load failed ({load_reason})")
+                    shutil.rmtree(out_dir, ignore_errors=True)
+                    continue
+                export_texture = self.mesh_has_texture(mesh)
+                if not export_texture:
+                    mesh = mesh.copy()
+                    mesh.remove_unreferenced_vertices()
+                self.export_trimesh_obj_assets(
+                    mesh,
+                    out_dir,
+                    export_texture=export_texture,
+                )
                 report.organized_objects += 1
             except Exception as exc:
                 report.failed_items.append(f"{mesh_path.name}: {exc}")

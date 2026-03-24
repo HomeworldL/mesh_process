@@ -35,7 +35,7 @@
 
 ## Build, Test, and Development Commands
 
-- Install dependencies: `pip install trimesh objaverse gdown tqdm pymeshlab pillow`
+- Install dependencies: `pip install trimesh objaverse gdown tqdm pillow`
 - Stage-1 ingest:
   - `python src/ingest_assets.py download --source YCB`
   - `python src/ingest_assets.py organize --source YCB`
@@ -66,20 +66,21 @@ Build `third_party/CoACD` and `third_party/ACVD` binaries before running `proces
     - inertia computation directly uses trimesh built-ins: `moment_inertia`, `moment_inertia_frame`, `principal_inertia_components`, `principal_inertia_transform`
     - principal axes are assigned with signed/permuted matching so new XYZ remains as close as possible to original XYZ while still aligned to principal directions
     - transformed manifold overwrites `manifold.obj` in principal-inertia frame
-  - raw mesh is transformed by the same principal-frame transform, then directly compressed to `visual.obj` (no `inertia.obj` output is kept)
+  - raw mesh is transformed by the same principal-frame transform before visual export (no `inertia.obj` output is kept)
   - `coacd.obj` is transformed by the same principal-frame transform
   - convex export -> `meshes/coacd_convex_piece_*.obj`
     - invalid CoACD parts are skipped during export if empty, if bbox max extent is below threshold, or if absolute volume is below threshold
   - `mesh_simplify` -> `simplified.obj` (default skip when exists)
   - `mesh_visual` -> `visual.obj` + optional visual material/texture compression outputs
-    - textured input is canonical single texture (`textured.mtl + texture_map.png`) and outputs single `visual_texture_map.png`
-    - visual geometry is decimated from transformed `raw.obj` (temporary file)
+    - textured input is fixed canonical stage-1 `textured.mtl` + `textured.png`, and stage-2 outputs fixed `textured_visual.mtl` + `textured_visual.png`
+    - untextured visual meshes are simplified from transformed `raw.obj` with trimesh quadric decimation and exported without UV/normal sidecars
+    - textured visual meshes are not geometrically simplified; `visual.obj` is the transformed raw mesh in principal-inertia frame, while only the visual PNG is compressed and the visual MTL is rewritten
+    - stage-2 visual mesh generation does not use pymeshlab and does not apply algorithm fallback
     - object is marked success only if generated `visual.obj` can be loaded as a non-empty scene with valid bounds
 - Default behavior:
   - step-level skip where outputs already exist
   - `--force` recomputes all steps
   - `--workers` enables object-level parallel processing
-  - `--preview` only with `--workers 1`
 - Dataset report: `assets/objects/processed/<dataset>/manifest.process_meshes.json`
 
 ## Stage-3 Description Build (`build_object_descriptions.py`)
@@ -103,14 +104,12 @@ Build `third_party/CoACD` and `third_party/ACVD` binaries before running `proces
   - normalized datasets (`ShapeNetCore`, `ShapeNetSem`, `DGN`, `DDG`): if source mass unknown, write `mass_kg=50.0`
   - other datasets: if source mass unknown, write `mass_kg=0.1`
 - Manifest texture policy: `has_texture` is determined only by whether `.png` texture files exist in the organized object folder.
-- Organized texture files must be `.png`; if source texture is non-png (e.g. `.jpg`), convert to `.png` during organize and do not keep the original non-png copy.
-- Organized asset canonical naming:
-  - mesh: `raw.obj`
-  - texture: `texture_map.png`
-  - material: `textured.mtl`
-  - `textured.mtl` should reference `texture_map.png` (`map_Kd texture_map.png`).
-  - Stage-1 texture canonicalization assumes single-texture assets for datasets/adapters that copy textures during organize; this is a downstream-oriented canonical export, not a guarantee of lossless preservation of arbitrary multi-material source assets.
-  - ShapeNetSem/ShapeNetCore default organize mode is OBJ-only; optional texture export can be enabled by env and is then canonicalized to single `texture_map.png`.
+- Organized asset naming:
+  - mesh is always exported as `raw.obj`
+  - stage-1 OBJ export is unified through `trimesh.exchange.obj.export_obj(...)`
+  - organized `raw.obj` is exported without `vn`
+  - if stage-1 exports texture sidecars, use the unified names `textured.mtl` and `textured.png`
+  - ShapeNetSem/ShapeNetCore default organize mode is OBJ-only
 - Organized object id naming:
   - default convention is `<SourceName>_<object_name>` (sanitize via `sanitize_object_id`).
   - handle collisions by suffix (`_2`, `_3`, ...).
@@ -119,8 +118,8 @@ Build `third_party/CoACD` and `third_party/ACVD` binaries before running `proces
 
 - Implement all 3 methods: `download`, `organize`, `build_manifest`.
 - `organize` must call `self.write_manifest_for_organize(cfg, report)` at end.
-- Use `canonicalize_texture_assets(...)` during organize if texture/mtl may exist.
-  - Only use it when the source is known to fit the current single-texture canonical workflow, or when single-texture canonicalization is an explicit acceptable simplification for that dataset.
+- Prefer trimesh-based export during organize for adapters that standardize OBJ assets.
+- Do not use the old `canonicalize_texture_assets(...)` path for new stage-1 organize logic.
 - `manifest` path fields must use repo-relative paths via `relative_to_repo(...)`.
 - `has_texture` must follow `.png`-only policy.
 - If source mass is unavailable, follow dataset policy above (`50.0` for normalized datasets; otherwise `0.1`).
@@ -143,8 +142,8 @@ Build `third_party/CoACD` and `third_party/ACVD` binaries before running `proces
   1. run `ingest_assets.py` (`download -> organize -> verify`),
   2. run `process_meshes.py --dataset <source>`,
   3. run `build_object_descriptions.py --dataset <source>`.
-- Verify outputs per object: `manifold.obj`, `coacd.obj`, `meshes/*.obj`, `simplified.obj`, `visual.obj`, optional `visual.mtl`, optional `visual_texture_map.png`, `.urdf`, `.xml`.
-  - For textured objects, current expectation is single visual texture file (`visual_texture_map.png`).
+- Verify outputs per object: `manifold.obj`, `coacd.obj`, `meshes/*.obj`, `simplified.obj`, `visual.obj`, optional `textured_visual.mtl`, optional `textured_visual.png`, `.urdf`, `.xml`.
+  - For textured objects, current expectation is exactly one rewritten visual MTL (`textured_visual.mtl`) plus one compressed visual PNG (`textured_visual.png`).
 
 ## Manifest Format
 

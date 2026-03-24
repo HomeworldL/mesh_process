@@ -13,7 +13,6 @@ from .base import (
     DownloadReport,
     IngestConfig,
     OrganizeReport,
-    canonicalize_texture_assets,
     relative_to_repo,
     sanitize_object_id,
     tqdm,
@@ -206,8 +205,7 @@ class HOPEAdapter(BaseIngestAdapter):
         notes.append(f"downloaded/ready objects: {len(completed)}/{len(expected_by_object)}")
         return dst_root, notes
 
-    @staticmethod
-    def _resolve_objects_root(source_dir: Path) -> Path:
+    def _resolve_objects_root(self, source_dir: Path) -> Path:
         if not source_dir.exists():
             return source_dir
         # Expected layout: <root>/<object_name>/google_16k/textured.obj
@@ -222,8 +220,7 @@ class HOPEAdapter(BaseIngestAdapter):
             return nested[0]
         return source_dir
 
-    @staticmethod
-    def _scale_obj_vertices(obj_path: Path, scale: float) -> int:
+    def _scale_obj_vertices(self, obj_path: Path, scale: float) -> int:
         """Scale OBJ `v` lines in-place and return count of scaled vertices."""
         lines = obj_path.read_text(encoding="utf-8", errors="ignore").splitlines()
         out_lines: list[str] = []
@@ -323,19 +320,29 @@ class HOPEAdapter(BaseIngestAdapter):
             if dst_obj.exists() and not cfg.force:
                 continue
 
-            shutil.copy2(src_obj, dst_obj)
-            scaled_vertices = self._scale_obj_vertices(dst_obj, self.mesh_scale)
-            if scaled_vertices == 0:
-                raise RuntimeError(f"HOPE organize failed to scale mesh (no vertices found): {dst_obj}")
-            mtl_src = mesh_dir / "textured.mtl"
-            tex_src = mesh_dir / "texture_map.png"
-            canonicalize_texture_assets(
-                dst_dir=dst_dir,
-                raw_obj_path=dst_obj,
-                texture_src=(tex_src if tex_src.exists() else None),
-                mtl_src=(mtl_src if mtl_src.exists() else None),
-                create_mtl_if_texture=False,
+            ok_load, load_reason, mesh = self.load_obj_mesh(
+                src_obj,
+                remove_unreferenced_vertices=False,
             )
+            if not ok_load or mesh is None:
+                report.failed_items.append(f"load failed for {object_id}: {load_reason}")
+                shutil.rmtree(dst_dir, ignore_errors=True)
+                continue
+            try:
+                export_texture = self.mesh_has_texture(mesh)
+                if not export_texture:
+                    mesh = mesh.copy()
+                    mesh.remove_unreferenced_vertices()
+                mesh.apply_scale(self.mesh_scale)
+                self.export_trimesh_obj_assets(
+                    mesh,
+                    dst_dir,
+                    export_texture=export_texture,
+                )
+            except Exception as exc:
+                report.failed_items.append(f"export failed for {object_id}: {exc}")
+                shutil.rmtree(dst_dir, ignore_errors=True)
+                continue
             report.organized_objects += 1
 
         report.notes.append(f"organized from {src_root}")

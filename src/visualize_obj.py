@@ -74,13 +74,20 @@ def main() -> None:
     print(f"[visualize] object_id={chosen.parent.name}")
     print(f"[visualize] selected={chosen}")
 
-    scene_or_mesh = trimesh.load(chosen, process=False, force="scene")
-    geometry = getattr(scene_or_mesh, "geometry", {})
-    if not geometry:
-        raise RuntimeError(
-            f"Loaded scene has no geometry: {chosen}. "
-            "Please rerun stage-2 with --force to regenerate visual assets."
-        )
+    scene_or_mesh = trimesh.load(chosen)
+    if isinstance(scene_or_mesh, trimesh.Scene):
+        geometry = getattr(scene_or_mesh, "geometry", {})
+        if not geometry:
+            raise RuntimeError(
+                f"Loaded scene has no geometry: {chosen}. "
+                "Please rerun stage-2 with --force to regenerate visual assets."
+            )
+    else:
+        if getattr(scene_or_mesh, "vertices", None) is None or len(scene_or_mesh.vertices) == 0:
+            raise RuntimeError(
+                f"Loaded mesh has no geometry: {chosen}. "
+                "Please rerun stage-2 with --force to regenerate visual assets."
+            )
     try:
         bounds = scene_or_mesh.bounds
     except Exception as e:

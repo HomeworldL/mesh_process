@@ -2,21 +2,17 @@
 
 from __future__ import annotations
 
-import csv
-from pathlib import Path, PurePosixPath
-import os
 import shutil
 import zipfile
+import csv
+from pathlib import Path, PurePosixPath
 
 from .base import (
-    CANONICAL_MTL_NAME,
     CANONICAL_RAW_OBJ_NAME,
     DownloadReport,
     IngestConfig,
     OrganizeReport,
-    canonicalize_texture_assets,
     relative_to_repo,
-    rewrite_obj_material_refs,
     sanitize_object_id,
     tqdm,
 )
@@ -36,18 +32,7 @@ class ShapeNetSemAdapter(_ShapeNetHFBaseAdapter):
         "ShapeNetSem.zip",
     ]
     _PREPARE_MARKER = ".prepare_sem_v2_complete"
-    _TEXTURE_LINE_PREFIXES = ("map_kd", "map_ka", "map_d", "map_bump", "bump")
-
-    @staticmethod
-    def _export_textures_enabled() -> bool:
-        # default OFF; enable with SHAPENET_EXPORT_TEXTURES=1 or SHAPENET_SEM_EXPORT_TEXTURES=1
-        v = os.environ.get("SHAPENET_SEM_EXPORT_TEXTURES", "").strip().lower()
-        if v in {"1", "true", "yes", "on"}:
-            return True
-        return _ShapeNetHFBaseAdapter._truthy_env("SHAPENET_EXPORT_TEXTURES")
-
-    @staticmethod
-    def _sem_instance_id(full_id: str) -> str:
+    def _sem_instance_id(self, full_id: str) -> str:
         val = full_id.strip()
         if val.startswith("wss."):
             return val[4:]
@@ -55,8 +40,7 @@ class ShapeNetSemAdapter(_ShapeNetHFBaseAdapter):
             return val.split(".", 1)[1]
         return val
 
-    @staticmethod
-    def _select_sem_instances(rows: list[dict[str, str]]) -> dict[str, str]:
+    def _select_sem_instances(self, rows: list[dict[str, str]]) -> dict[str, str]:
         selected: dict[str, str] = {}
         for row in rows:
             category_text = row.get("category") or ""
@@ -64,7 +48,7 @@ class ShapeNetSemAdapter(_ShapeNetHFBaseAdapter):
                 continue
 
             full_id = row.get("fullId") or ""
-            instance_id = ShapeNetSemAdapter._sem_instance_id(full_id)
+            instance_id = self._sem_instance_id(full_id)
             if not instance_id:
                 continue
             if instance_id in SHAPENET_SEM_BAD_INSTANCE_IDS:
@@ -98,8 +82,7 @@ class ShapeNetSemAdapter(_ShapeNetHFBaseAdapter):
             reader = csv.DictReader(csvfile)
             return [dict(row) for row in reader]
 
-    @staticmethod
-    def _find_sem_root(snapshot_dir: Path) -> Path | None:
+    def _find_sem_root(self, snapshot_dir: Path) -> Path | None:
         for metadata_csv in sorted(snapshot_dir.rglob("metadata.csv")):
             root = metadata_csv.parent
             if (root / "models-OBJ" / "models").is_dir():
@@ -243,27 +226,14 @@ class ShapeNetSemAdapter(_ShapeNetHFBaseAdapter):
         seen_ids = {p.name for p in processed_dir.iterdir() if p.is_dir()}
 
         obj_root = sem_root / "models-OBJ" / "models"
-        tex_root = sem_root / "models-textures" / "textures"
-        texture_by_name: dict[str, Path] = {}
-        export_textures = self._export_textures_enabled()
-        if export_textures and tex_root.is_dir():
-            for p in tex_root.rglob("*"):
-                if not p.is_file():
-                    continue
-                if p.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
-                    continue
-                texture_by_name.setdefault(p.name, p)
-
         iterable = list(selected_instances.items())
         if tqdm is not None:
             iterable = tqdm(iterable, desc="ShapeNetSem organize", unit="obj")
 
-        baked_single_texture = 0
         normalized_count = 0
         dropped_bad_scale = 0
         for instance_id, category in iterable:
             src_obj = obj_root / f"{instance_id}.obj"
-            src_mtl = obj_root / f"{instance_id}.mtl"
 
             if not src_obj.is_file():
                 report.failed_items.append(f"missing obj for {instance_id}")
@@ -304,87 +274,6 @@ class ShapeNetSemAdapter(_ShapeNetHFBaseAdapter):
                 continue
             normalized_count += 1
 
-            if export_textures:
-                texture_src: Path | None = None
-                texture_refs = (
-                    self._parse_mtl_texture_refs(
-                        src_mtl,
-                        texture_line_prefixes=self._TEXTURE_LINE_PREFIXES,
-                    )
-                    if src_mtl.is_file()
-                    else []
-                )
-                has_jpg_in_source_mtl = any(Path(x).suffix.lower() in {".jpg", ".jpeg"} for x in texture_refs)
-                texture_rename_map: dict[str, str] = {}
-                copied_textures: list[tuple[str, Path]] = []
-                for tex_name in texture_refs:
-                    candidate = texture_by_name.get(tex_name)
-                    if candidate is None or not candidate.is_file():
-                        continue
-                    copied_textures.append((tex_name, candidate))
-                    if texture_src is None:
-                        texture_src = candidate
-
-                if not copied_textures and tex_root.is_dir():
-                    for ext in [".jpg", ".jpeg", ".png"]:
-                        candidate = texture_by_name.get(f"{instance_id}{ext}")
-                        if candidate is not None and candidate.is_file():
-                            copied_textures.append((candidate.name, candidate))
-                            texture_src = candidate
-                            break
-
-                for idx_tex, (orig_name, candidate) in enumerate(copied_textures):
-                    renamed = f"texture_map_{idx_tex}.png"
-                    dst_png = dst_dir / renamed
-                    ok = self._copy_texture_to_png(candidate, dst_png)
-                    if not ok:
-                        continue
-                    texture_rename_map[orig_name] = renamed
-
-                canonical_mtl = dst_dir / CANONICAL_MTL_NAME
-                if src_mtl.is_file():
-                    self._rewrite_mtl_with_local_textures(
-                        src_mtl=src_mtl,
-                        dst_mtl=canonical_mtl,
-                        texture_rename_map=texture_rename_map,
-                        texture_line_prefixes=self._TEXTURE_LINE_PREFIXES,
-                    )
-                    rewrite_obj_material_refs(obj_path=dst_obj, mtl_name=CANONICAL_MTL_NAME)
-                elif texture_src is not None:
-                    fallback_png = dst_dir / "texture_map_0.png"
-                    if self._copy_texture_to_png(texture_src, fallback_png):
-                        texture_src = fallback_png
-                    else:
-                        texture_src = None
-                    canonicalize_texture_assets(
-                        dst_dir=dst_dir,
-                        raw_obj_path=dst_obj,
-                        texture_src=texture_src,
-                        mtl_src=None,
-                        create_mtl_if_texture=True,
-                    )
-
-                if has_jpg_in_source_mtl and canonical_mtl.is_file():
-                    baked_ok, _ = self._bake_single_texture_png(
-                        dst_dir=dst_dir,
-                        raw_obj_path=dst_obj,
-                        src_mtl_path=canonical_mtl,
-                    )
-                    if baked_ok:
-                        baked_single_texture += 1
-
-                # Enforce final canonical output: raw.obj + optional single texture_map.png/textured.mtl.
-                tex_candidates = sorted(p for p in dst_dir.glob("*.png") if p.is_file())
-                tex_pick = tex_candidates[0] if tex_candidates else None
-                mtl_pick = canonical_mtl if canonical_mtl.is_file() else None
-                canonicalize_texture_assets(
-                    dst_dir=dst_dir,
-                    raw_obj_path=dst_obj,
-                    texture_src=tex_pick,
-                    mtl_src=mtl_pick,
-                    create_mtl_if_texture=True,
-                )
-
             report.organized_objects += 1
 
         report.notes.append(f"organized from extracted root: {relative_to_repo(cfg.repo_root, sem_root)}")
@@ -397,9 +286,6 @@ class ShapeNetSemAdapter(_ShapeNetHFBaseAdapter):
         report.notes.append(
             f"ShapeNetSem normalize stats: normalized={normalized_count}, dropped_bad_scale={dropped_bad_scale}"
         )
-        if export_textures:
-            report.notes.append(f"ShapeNetSem texture export: enabled, baked_single_texture={baked_single_texture}")
-        else:
-            report.notes.append("ShapeNetSem texture export: disabled (default), organized OBJ-only")
+        report.notes.append("ShapeNetSem texture export: disabled, organized OBJ-only")
         self.write_manifest_for_organize(cfg, report)
         return report

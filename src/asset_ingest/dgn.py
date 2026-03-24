@@ -36,8 +36,10 @@ class DGNAdapter(BaseIngestAdapter):
     archive_name = "DGN_obj_raw.zip"
     extract_dirname = "DGN_obj_raw"
 
-    @staticmethod
-    def _skip_zip_member(member_name: str) -> bool:
+    def _skip_zip_member(self, member_name: str) -> bool:
+        # EN: Drop macOS metadata files during unzip so they never appear as
+        # candidate stage-1 meshes.
+        # ZH: 解压时跳过 macOS 元数据文件，避免它们进入一阶段 mesh 候选集。
         normalized = member_name.replace("\\", "/")
         parts = [p for p in normalized.split("/") if p]
         if any(p == "__MACOSX" for p in parts):
@@ -87,8 +89,11 @@ class DGNAdapter(BaseIngestAdapter):
         return report
 
     def _build_manifest_for_dataset(self, cfg: IngestConfig, dataset_name: str) -> IngestManifest:
-        # DGNAdapter organizes one source archive into two processed datasets (DGN + DDG),
-        # so this helper reuses the shared manifest builder for either target dataset.
+        # EN: One source archive is organized into two processed datasets:
+        # the full DGN set and the DDG prefix subset. Reuse the shared builder
+        # for both outputs instead of maintaining two manifest code paths.
+        # ZH: 一个源压缩包会整理出两个 processed 数据集：完整 DGN 和
+        # DDG 前缀子集。这里复用同一套 manifest 构建逻辑，避免维护两份实现。
         return self.build_manifest_from_processed_dir(
             cfg,
             homepage="https://huggingface.co/datasets/JiayiChenPKU/BODex",
@@ -139,8 +144,11 @@ class DGNAdapter(BaseIngestAdapter):
             if not raw_name:
                 continue
 
-            # 1) Always keep full DGN set.
-            # Keep source naming (sanitized) for DGN object ids; do not add extra prefix.
+            # EN: Always export the full source object into the DGN dataset.
+            # Preserve source naming (after sanitization) instead of adding a
+            # dataset prefix, so DGN ids stay close to the original archive ids.
+            # ZH: 每个源对象都先进入完整 DGN 集合。对象 id 仅做 sanitize，
+            # 不额外添加数据集前缀，以保持与源压缩包命名尽量接近。
             base_id_dgn = raw_name
             object_id_dgn = base_id_dgn
             suffix = 1
@@ -156,14 +164,43 @@ class DGNAdapter(BaseIngestAdapter):
             dgn_dst_obj = dgn_dst_dir / CANONICAL_RAW_OBJ_NAME
             dgn_ready = dgn_dst_obj.exists() and not cfg.force
             if not dgn_dst_obj.exists() or cfg.force:
-                ok_norm, norm_reason, norm_metrics = self.normalize_obj_center_and_scale(
+                # EN: Normalize first, then export through the shared trimesh
+                # stage-1 writer. This keeps DGN's geometry policy separate from
+                # the actual asset export policy.
+                # ZH: 先做归一化，再走共享的一阶段 trimesh 导出逻辑。
+                # 这样 DGN 的几何归一化策略和最终资产导出策略是分离的。
+                ok_norm, norm_reason, norm_mesh, norm_metrics = self.load_normalized_obj_mesh(
                     src_obj_path=src_obj,
-                    dst_obj_path=dgn_dst_obj,
                 )
-                if not ok_norm:
+                if not ok_norm or norm_mesh is None:
                     dropped_bad_scale += 1
                     report.failed_items.append(
                         f"drop {src_obj.name}: normalize failed ({norm_reason}); metrics={norm_metrics}"
+                    )
+                    shutil.rmtree(dgn_dst_dir, ignore_errors=True)
+                    continue
+                try:
+                    self.export_trimesh_obj_assets(
+                        norm_mesh,
+                        dgn_dst_dir,
+                        export_texture=False,
+                    )
+                except Exception as exc:
+                    dropped_bad_scale += 1
+                    report.failed_items.append(
+                        f"drop {src_obj.name}: export failed ({exc}); metrics={norm_metrics}"
+                    )
+                    shutil.rmtree(dgn_dst_dir, ignore_errors=True)
+                    continue
+                ok_post, post_reason = self.validate_normalized_obj_export(
+                    dgn_dst_obj,
+                    target_max_extent=1.0,
+                    metrics=norm_metrics,
+                )
+                if not ok_post:
+                    dropped_bad_scale += 1
+                    report.failed_items.append(
+                        f"drop {src_obj.name}: normalize export invalid ({post_reason}); metrics={norm_metrics}"
                     )
                     shutil.rmtree(dgn_dst_dir, ignore_errors=True)
                     continue
@@ -172,7 +209,10 @@ class DGNAdapter(BaseIngestAdapter):
                 report.organized_objects += 1
                 dgn_ready = True
 
-            # 2) Additionally export DDG subset (prefix ddg*).
+            # EN: DDG is a derived subset view of DGN: any source object whose
+            # name starts with `ddg` is copied into the secondary DDG dataset.
+            # ZH: DDG 是 DGN 的派生子集视图：凡是源文件名以 `ddg` 开头的对象，
+            # 都会再复制到第二个 DDG 数据集中。
             if raw_name.lower().startswith("ddg") and dgn_ready:
                 ddg_suffix = raw_name
                 raw_lower = raw_name.lower()
@@ -202,10 +242,15 @@ class DGNAdapter(BaseIngestAdapter):
                     shutil.copy2(dgn_dst_obj, ddg_dst_obj)
                     ddg_count += 1
 
-        # Keep ingest CLI compatibility: DGN source manifest at processed/DGN/manifest.json
+        # EN: Keep ingest CLI compatibility by writing the primary manifest at
+        # processed/DGN/manifest.json, then emit the derived DDG manifest too.
+        # ZH: 为保持 ingest CLI 兼容性，主 manifest 仍写到
+        # processed/DGN/manifest.json，同时额外写出派生的 DDG manifest。
         print("[DGN] Writing DGN manifest and scanning DGN bbox stats...")
         self.write_manifest_for_organize(cfg, report)
-        # Also emit derived DDG manifest to make downstream pipeline consistent.
+        # EN: Also emit the DDG manifest so stage-2/3 can treat DDG like a
+        # normal dataset root.
+        # ZH: 同时写出 DDG manifest，让二三阶段也能把 DDG 当成普通数据集处理。
         print("[DGN] Writing DDG manifest...")
         ddg_manifest = self._build_manifest_for_dataset(cfg, "DDG")
         ddg_manifest_path = cfg.processed_root / "DDG" / "manifest.json"

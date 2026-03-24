@@ -2,19 +2,15 @@
 
 from __future__ import annotations
 
-import os
 import shutil
 from pathlib import Path, PurePosixPath
 
 from .base import (
-    CANONICAL_MTL_NAME,
     CANONICAL_RAW_OBJ_NAME,
     DownloadReport,
     IngestConfig,
     OrganizeReport,
-    canonicalize_texture_assets,
     relative_to_repo,
-    rewrite_obj_material_refs,
     sanitize_object_id,
     tqdm,
 )
@@ -33,19 +29,9 @@ class ShapeNetCoreAdapter(_ShapeNetHFBaseAdapter):
         "README.md",
         "ShapeNetCore.v2.zip",
     ]
-    _TEXTURE_LINE_PREFIXES = ("map_kd", "map_ka", "map_d", "map_bump", "bump")
     _PREPARE_MARKER = ".prepare_core_v2_complete"
 
-    @staticmethod
-    def _export_textures_enabled() -> bool:
-        # default OFF; enable with SHAPENET_EXPORT_TEXTURES=1 or SHAPENET_CORE_EXPORT_TEXTURES=1
-        v = os.environ.get("SHAPENET_CORE_EXPORT_TEXTURES", "").strip().lower()
-        if v in {"1", "true", "yes", "on"}:
-            return True
-        return _ShapeNetHFBaseAdapter._truthy_env("SHAPENET_EXPORT_TEXTURES")
-
-    @staticmethod
-    def _find_core_root(snapshot_dir: Path) -> Path | None:
+    def _find_core_root(self, snapshot_dir: Path) -> Path | None:
         synset_codes = list(SHAPENET_CORE_CATEGORIES.values())
         stack: list[Path] = [snapshot_dir]
         best_root: Path | None = None
@@ -142,10 +128,8 @@ class ShapeNetCoreAdapter(_ShapeNetHFBaseAdapter):
                 return report
 
         seen_ids = {p.name for p in processed_dir.iterdir() if p.is_dir()}
-        baked_single_texture = 0
         normalized_count = 0
         dropped_bad_scale = 0
-        export_textures = self._export_textures_enabled()
 
         candidates: list[tuple[str, Path]] = []
         for category, synset_code in SHAPENET_CORE_CATEGORIES.items():
@@ -166,9 +150,6 @@ class ShapeNetCoreAdapter(_ShapeNetHFBaseAdapter):
 
             model_dir = instance_dir / "models"
             src_obj = model_dir / "model_normalized.obj"
-            src_mtl = model_dir / "model_normalized.mtl"
-            src_json = model_dir / "model_normalized.json"
-            images_dir = instance_dir / "images"
             if not src_obj.is_file():
                 continue
 
@@ -206,68 +187,6 @@ class ShapeNetCoreAdapter(_ShapeNetHFBaseAdapter):
                 continue
             normalized_count += 1
 
-            if export_textures:
-                texture_rename_map: dict[str, str] = {}
-                copied_png_count = 0
-                texture_refs = (
-                    self._parse_mtl_texture_refs(
-                        src_mtl,
-                        texture_line_prefixes=self._TEXTURE_LINE_PREFIXES,
-                    )
-                    if src_mtl.is_file()
-                    else []
-                )
-                has_jpg_in_source_mtl = any(Path(x).suffix.lower() in {".jpg", ".jpeg"} for x in texture_refs)
-                for idx_tex, tex_name in enumerate(texture_refs):
-                    src_tex = images_dir / tex_name
-                    if not src_tex.is_file():
-                        src_tex = images_dir / Path(tex_name).name
-                    if not src_tex.is_file():
-                        continue
-                    renamed = f"texture_map_{idx_tex}.png"
-                    if self._copy_texture_to_png(src_tex, dst_dir / renamed):
-                        texture_rename_map[Path(tex_name).name] = renamed
-                        copied_png_count += 1
-
-                if src_mtl.is_file():
-                    self._rewrite_mtl_with_local_textures(
-                        src_mtl=src_mtl,
-                        dst_mtl=dst_dir / CANONICAL_MTL_NAME,
-                        texture_rename_map=texture_rename_map,
-                        texture_line_prefixes=self._TEXTURE_LINE_PREFIXES,
-                    )
-                    rewrite_obj_material_refs(obj_path=dst_obj, mtl_name=CANONICAL_MTL_NAME)
-                elif copied_png_count > 0:
-                    canonicalize_texture_assets(
-                        dst_dir=dst_dir,
-                        raw_obj_path=dst_obj,
-                        texture_src=(dst_dir / "texture_map_0.png"),
-                        mtl_src=None,
-                        create_mtl_if_texture=True,
-                    )
-
-                canonical_mtl = dst_dir / CANONICAL_MTL_NAME
-                if has_jpg_in_source_mtl and canonical_mtl.is_file():
-                    baked_ok, _ = self._bake_single_texture_png(
-                        dst_dir=dst_dir,
-                        raw_obj_path=dst_obj,
-                        src_mtl_path=canonical_mtl,
-                    )
-                    if baked_ok:
-                        baked_single_texture += 1
-
-                # Enforce final canonical output: raw.obj + optional single texture_map.png/textured.mtl.
-                tex_candidates = sorted(p for p in dst_dir.glob("*.png") if p.is_file())
-                tex_pick = tex_candidates[0] if tex_candidates else None
-                mtl_pick = canonical_mtl if canonical_mtl.is_file() else None
-                canonicalize_texture_assets(
-                    dst_dir=dst_dir,
-                    raw_obj_path=dst_obj,
-                    texture_src=tex_pick,
-                    mtl_src=mtl_pick,
-                    create_mtl_if_texture=True,
-                )
-
             report.organized_objects += 1
 
         report.notes.append(f"organized from extracted root: {relative_to_repo(cfg.repo_root, core_root)}")
@@ -281,9 +200,6 @@ class ShapeNetCoreAdapter(_ShapeNetHFBaseAdapter):
         report.notes.append(
             f"ShapeNetCore normalize stats: normalized={normalized_count}, dropped_bad_scale={dropped_bad_scale}"
         )
-        if export_textures:
-            report.notes.append(f"ShapeNetCore texture export: enabled, baked_single_texture={baked_single_texture}")
-        else:
-            report.notes.append("ShapeNetCore texture export: disabled (default), organized OBJ-only")
+        report.notes.append("ShapeNetCore texture export: disabled, organized OBJ-only")
         self.write_manifest_for_organize(cfg, report)
         return report

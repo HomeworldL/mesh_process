@@ -11,7 +11,6 @@ from .base import (
     DownloadReport,
     IngestConfig,
     OrganizeReport,
-    canonicalize_texture_assets,
     download_google_drive_file,
     extract_zip,
     relative_to_repo,
@@ -46,16 +45,14 @@ class GraspNetAdapter(BaseIngestAdapter):
 
         return report
 
-    @staticmethod
-    def _choose_obj(obj_paths: list[Path]) -> Path:
+    def _choose_obj(self, obj_paths: list[Path]) -> Path:
         names = {p.name.lower(): p for p in obj_paths}
         for key in ["textured.obj", "nontextured.obj", "model.obj", "mesh.obj"]:
             if key in names:
                 return names[key]
         return sorted(obj_paths)[0]
 
-    @staticmethod
-    def _resolve_models_root(source_root: Path) -> Path:
+    def _resolve_models_root(self, source_root: Path) -> Path:
         # Expected layout after extraction:
         # raw/GraspNet/models/models/<object_id>/
         direct = source_root / "models" / "models"
@@ -105,17 +102,28 @@ class GraspNetAdapter(BaseIngestAdapter):
             if dst_obj.exists() and not cfg.force:
                 continue
 
-            # Keep only raw mesh + canonical texture assets.
-            shutil.copy2(chosen, dst_obj)
-            mtl_src = folder / "textured.mtl"
-            tex_src = folder / "texture_map.png"
-            canonicalize_texture_assets(
-                dst_dir=dst_dir,
-                raw_obj_path=dst_obj,
-                texture_src=(tex_src if tex_src.is_file() else None),
-                mtl_src=(mtl_src if mtl_src.is_file() else None),
-                create_mtl_if_texture=False,
+            ok_load, load_reason, mesh = self.load_obj_mesh(
+                chosen,
+                remove_unreferenced_vertices=False,
             )
+            if not ok_load or mesh is None:
+                report.failed_items.append(f"load failed for {object_id}: {load_reason}")
+                shutil.rmtree(dst_dir, ignore_errors=True)
+                continue
+            try:
+                export_texture = self.mesh_has_texture(mesh)
+                if not export_texture:
+                    mesh = mesh.copy()
+                    mesh.remove_unreferenced_vertices()
+                self.export_trimesh_obj_assets(
+                    mesh,
+                    dst_dir,
+                    export_texture=export_texture,
+                )
+            except Exception as exc:
+                report.failed_items.append(f"export failed for {object_id}: {exc}")
+                shutil.rmtree(dst_dir, ignore_errors=True)
+                continue
             report.organized_objects += 1
 
         report.notes.append(f"organized from {src_root}")

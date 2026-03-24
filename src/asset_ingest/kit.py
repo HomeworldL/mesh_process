@@ -17,7 +17,6 @@ from .base import (
     DownloadReport,
     IngestConfig,
     OrganizeReport,
-    canonicalize_texture_assets,
     relative_to_repo,
     sanitize_object_id,
     tqdm,
@@ -68,8 +67,7 @@ class KITAdapter(BaseIngestAdapter):
         out.sort(key=lambda x: x.object_name.lower())
         return out
 
-    @staticmethod
-    def _download_file(url: str, dst: Path) -> None:
+    def _download_file(self, url: str, dst: Path) -> None:
         dst.parent.mkdir(parents=True, exist_ok=True)
         tmp = dst.with_suffix(dst.suffix + ".part")
         if tmp.exists():
@@ -82,8 +80,7 @@ class KITAdapter(BaseIngestAdapter):
                 f.write(chunk)
         tmp.replace(dst)
 
-    @staticmethod
-    def _extract_mesh_zip(zip_path: Path, out_dir: Path, force: bool) -> None:
+    def _extract_mesh_zip(self, zip_path: Path, out_dir: Path, force: bool) -> None:
         if out_dir.exists() and force:
             shutil.rmtree(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -135,8 +132,7 @@ class KITAdapter(BaseIngestAdapter):
         report.notes.append(f"archives discovered: {len(archives)}")
         return report
 
-    @staticmethod
-    def _choose_obj(obj_paths: list[Path]) -> Path:
+    def _choose_obj(self, obj_paths: list[Path]) -> Path:
         def score(path: Path) -> tuple[int, str]:
             n = path.name.lower()
             if n.endswith("_orig_tex.obj"):
@@ -155,8 +151,7 @@ class KITAdapter(BaseIngestAdapter):
 
         return sorted(obj_paths, key=score)[0]
 
-    @staticmethod
-    def _pick_sidecar(folder: Path, chosen_obj: Path) -> tuple[Path | None, Path | None]:
+    def _pick_sidecar(self, folder: Path, chosen_obj: Path) -> tuple[Path | None, Path | None]:
         # Prefer sidecars matching selected OBJ stem.
         stem = chosen_obj.stem
         mtl = folder / f"{stem}.mtl"
@@ -206,15 +201,33 @@ class KITAdapter(BaseIngestAdapter):
             if dst_obj.exists() and not cfg.force:
                 continue
 
-            shutil.copy2(chosen, dst_obj)
-            mtl_src, tex_src = self._pick_sidecar(folder, chosen)
-            canonicalize_texture_assets(
-                dst_dir=dst_dir,
-                raw_obj_path=dst_obj,
-                texture_src=tex_src,
-                mtl_src=mtl_src,
-                create_mtl_if_texture=False,
+            ok_load, load_reason, mesh = self.load_obj_mesh(
+                chosen,
+                remove_unreferenced_vertices=False,
             )
+            if not ok_load or mesh is None:
+                report.failed_items.append(f"load failed for {object_id}: {load_reason}")
+                shutil.rmtree(dst_dir, ignore_errors=True)
+                continue
+            mtl_src, tex_src = self._pick_sidecar(folder, chosen)
+            try:
+                export_texture = (
+                    mtl_src is not None
+                    and tex_src is not None
+                    and self.mesh_has_texture(mesh)
+                )
+                if not export_texture:
+                    mesh = mesh.copy()
+                    mesh.remove_unreferenced_vertices()
+                self.export_trimesh_obj_assets(
+                    mesh,
+                    dst_dir,
+                    export_texture=export_texture,
+                )
+            except Exception as exc:
+                report.failed_items.append(f"export failed for {object_id}: {exc}")
+                shutil.rmtree(dst_dir, ignore_errors=True)
+                continue
             report.organized_objects += 1
 
         report.notes.append(f"organized from {src_root}")

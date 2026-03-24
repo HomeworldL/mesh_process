@@ -15,6 +15,9 @@ import sys
 import zipfile
 from urllib.request import urlopen
 
+import trimesh
+from trimesh.exchange.obj import export_obj
+
 from .manifest import (
     IngestManifest,
     ManifestSource,
@@ -32,7 +35,7 @@ except Exception:  # pragma: no cover - tqdm is optional at runtime
 DEFAULT_MASS_KG = 0.1
 CANONICAL_RAW_OBJ_NAME = "raw.obj"
 CANONICAL_MTL_NAME = "textured.mtl"
-CANONICAL_TEXTURE_NAME = "texture_map.png"
+CANONICAL_TEXTURE_NAME = "textured.png"
 
 
 @dataclass
@@ -132,8 +135,7 @@ class BaseIngestAdapter(ABC):
             check_paths=check_paths,
         )
 
-    @staticmethod
-    def _detect_texture_policy(has_texture_values: list[str]) -> str:
+    def _detect_texture_policy(self, has_texture_values: list[str]) -> str:
         """
         EN: Collapse per-object `has_texture` flags into summary policy.
         ZH: 将逐物体 `has_texture` 汇总成 manifest summary 里的策略字段。
@@ -149,8 +151,7 @@ class BaseIngestAdapter(ABC):
             return "unknown"
         return "mixed"
 
-    @staticmethod
-    def _default_mtl_path(obj_dir: Path) -> Path | None:
+    def _default_mtl_path(self, obj_dir: Path) -> Path | None:
         """
         EN: Prefer canonical `textured.mtl`, otherwise fall back to the first local `.mtl`.
         ZH: 优先使用规范名 `textured.mtl`，否则回退到目录中的第一个 `.mtl`。
@@ -259,8 +260,7 @@ class BaseIngestAdapter(ABC):
         )
         return manifest
 
-    @staticmethod
-    def _parse_obj_vertex_xyz(line: str) -> tuple[float, float, float] | None:
+    def _parse_obj_vertex_xyz(self, line: str) -> tuple[float, float, float] | None:
         """
         EN: Parse one OBJ `v` record into xyz floats.
         ZH: 将一行 OBJ `v` 记录解析为 xyz 浮点坐标。
@@ -278,8 +278,218 @@ class BaseIngestAdapter(ABC):
             return None
         return xyz
 
-    @staticmethod
+    def load_obj_mesh(
+        self,
+        src_obj_path: Path,
+        *,
+        remove_unreferenced_vertices: bool = True,
+    ) -> tuple[bool, str, Any | None]:
+        """
+        EN: Load one OBJ into a trimesh mesh object for canonical stage-1 export.
+        ZH: 用 trimesh 加载一个 OBJ，为一阶段统一导出做准备。
+
+        Used by / 用于: canonical organize export for DGN, YCB, and future adapters.
+        """
+        try:
+            mesh = trimesh.load(str(src_obj_path))
+        except Exception as e:
+            return False, f"failed to load obj: {e}", None
+
+        if isinstance(mesh, trimesh.Scene):
+            geoms = list(getattr(mesh, "geometry", {}).values())
+            if not geoms:
+                return False, "loaded object is an empty trimesh scene", None
+            if len(geoms) == 1:
+                mesh = geoms[0]
+            else:
+                try:
+                    mesh = trimesh.util.concatenate(geoms)
+                except Exception as e:
+                    return False, f"failed to merge scene geometry: {e}", None
+
+        if not isinstance(mesh, trimesh.Trimesh):
+            return False, "loaded object is not a trimesh mesh", None
+        if mesh.vertices is None or len(mesh.vertices) == 0:
+            return False, "loaded object has no valid mesh vertices", None
+        if mesh.faces is None or len(mesh.faces) == 0:
+            return False, "loaded object has no valid mesh faces", None
+
+        try:
+            mesh = mesh.copy()
+            if remove_unreferenced_vertices:
+                mesh.remove_unreferenced_vertices()
+        except Exception as e:
+            return False, f"failed to clean mesh: {e}", None
+
+        if mesh.vertices is None or len(mesh.vertices) == 0:
+            return False, "mesh has no vertices after cleanup", None
+        if mesh.faces is None or len(mesh.faces) == 0:
+            return False, "mesh has no faces after cleanup", None
+        return True, "loaded", mesh
+
+    def mesh_has_texture(self, mesh: Any) -> bool:
+        """
+        EN: Best-effort check whether a trimesh mesh carries texture-based visuals.
+        ZH: 尽力判断 trimesh mesh 是否带有基于纹理贴图的 visual 信息。
+
+        Used by / 用于: canonical organize export for textured datasets such as YCB.
+        """
+        visual = getattr(mesh, "visual", None)
+        if visual is None:
+            return False
+        uv = getattr(visual, "uv", None)
+        material = getattr(visual, "material", None)
+        image = None
+        if material is not None:
+            image = (
+                getattr(material, "image", None)
+                or getattr(material, "baseColorTexture", None)
+            )
+        return uv is not None and image is not None
+
+    def export_trimesh_obj_assets(
+        self,
+        mesh: Any,
+        dst_dir: Path,
+        *,
+        export_texture: bool,
+        obj_name: str = CANONICAL_RAW_OBJ_NAME,
+    ) -> tuple[Path, Path | None, Path | None]:
+        """
+        EN: Export one trimesh mesh into unified stage-1 assets:
+        `raw.obj` and optional `textured.mtl` + `textured.png`.
+        ZH: 将 trimesh mesh 统一导出为一阶段资产：
+        `raw.obj`，以及可选的 `textured.mtl` + `textured.png`。
+
+        Used by / 用于: DGN, YCB, and future adapters that standardize organize output
+        via trimesh export.
+        """
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        dst_obj_path = dst_dir / obj_name
+
+        for p in sorted(dst_dir.glob("*.mtl")):
+            p.unlink(missing_ok=True)
+        for p in sorted(dst_dir.glob("*.png")):
+            p.unlink(missing_ok=True)
+        for p in sorted(dst_dir.glob("*.jpg")):
+            p.unlink(missing_ok=True)
+        for p in sorted(dst_dir.glob("*.jpeg")):
+            p.unlink(missing_ok=True)
+
+        try:
+            obj_text, sidecars = export_obj(
+                mesh,
+                include_normals=False,
+                include_texture=bool(export_texture),
+                return_texture=True,
+                write_texture=False,
+                mtl_name=CANONICAL_MTL_NAME,
+                digits=9,
+            )
+            dst_obj_path.write_text(obj_text, encoding="utf-8")
+
+            dst_tex_path: Path | None = None
+            dst_mtl_path: Path | None = None
+            mtl_bytes = sidecars.get(CANONICAL_MTL_NAME)
+            texture_keys = [
+                name
+                for name in sorted(sidecars.keys())
+                if Path(name).suffix.lower() in {".png", ".jpg", ".jpeg"}
+            ]
+
+            if export_texture and texture_keys:
+                src_tex_name = texture_keys[0]
+                texture_payload = sidecars[src_tex_name]
+                dst_tex_path = dst_dir / CANONICAL_TEXTURE_NAME
+                if isinstance(texture_payload, bytes):
+                    dst_tex_path.write_bytes(texture_payload)
+                else:
+                    dst_tex_path.write_text(str(texture_payload), encoding="utf-8")
+
+                if mtl_bytes is not None:
+                    mtl_text = (
+                        mtl_bytes.decode("utf-8", errors="ignore")
+                        if isinstance(mtl_bytes, bytes)
+                        else str(mtl_bytes)
+                    )
+                    mtl_text = mtl_text.replace(src_tex_name, CANONICAL_TEXTURE_NAME)
+                    dst_mtl_path = dst_dir / CANONICAL_MTL_NAME
+                    dst_mtl_path.write_text(mtl_text, encoding="utf-8")
+            elif export_texture and mtl_bytes is not None:
+                dst_mtl_path = dst_dir / CANONICAL_MTL_NAME
+                if isinstance(mtl_bytes, bytes):
+                    dst_mtl_path.write_bytes(mtl_bytes)
+                else:
+                    dst_mtl_path.write_text(str(mtl_bytes), encoding="utf-8")
+            return dst_obj_path, dst_tex_path, dst_mtl_path
+        except Exception as e:
+            raise RuntimeError(f"failed to export trimesh obj assets to {dst_dir}: {e}") from e
+
+    def load_normalized_obj_mesh(
+        self,
+        src_obj_path: Path,
+        *,
+        target_max_extent: float = 1.0,
+        min_extent_eps: float = 1e-9,
+        max_aspect_ratio: float = 1e5,
+    ) -> tuple[bool, str, Any | None, dict[str, float]]:
+        """
+        EN: Load and normalize OBJ geometry with the ShapeNet policy, returning a mesh.
+        ZH: 按 ShapeNet 规则加载并归一化 OBJ，返回归一化后的 mesh 对象。
+
+        Used by / 用于: DGN organize and normalize_obj_center_and_scale wrapper.
+        """
+        metrics: dict[str, float] = {}
+        ok, msg, mesh = self.load_obj_mesh(
+            src_obj_path,
+            remove_unreferenced_vertices=True,
+        )
+        if not ok or mesh is None:
+            return False, msg, None, metrics
+
+        pre_vertex_count = int(len(mesh.vertices))
+        bounds = mesh.bounds
+        if bounds is None or len(bounds) != 2:
+            return False, "mesh has invalid bounds after cleanup", None, metrics
+
+        extent = bounds[1] - bounds[0]
+        if not all(math.isfinite(float(x)) for x in extent):
+            return False, "non-finite bounds extent", None, metrics
+
+        pre_max_extent = float(max(extent))
+        pre_min_extent = float(min(extent))
+        pre_aspect_ratio = float(pre_max_extent / max(pre_min_extent, min_extent_eps))
+        metrics["pre_max_extent"] = pre_max_extent
+        metrics["pre_min_extent"] = pre_min_extent
+        metrics["pre_aspect_ratio"] = pre_aspect_ratio
+        metrics["kept_vertex_count"] = float(len(mesh.vertices))
+        metrics["dropped_unreferenced_vertices"] = float(pre_vertex_count - len(mesh.vertices))
+
+        if pre_max_extent <= min_extent_eps:
+            return False, f"degenerate mesh extent: max_extent={pre_max_extent:.3e}", None, metrics
+        if pre_aspect_ratio > max_aspect_ratio:
+            return (
+                False,
+                (
+                    "extreme aspect ratio before normalization: "
+                    f"{pre_aspect_ratio:.3e} > {max_aspect_ratio:.3e}"
+                ),
+                None,
+                metrics,
+            )
+
+        center = mesh.bounding_box.centroid
+        scale = float(target_max_extent / pre_max_extent)
+
+        try:
+            mesh.apply_translation(-center)
+            mesh.apply_scale(scale)
+        except Exception as e:
+            return False, f"failed to normalize mesh transform: {e}", None, metrics
+        return True, "normalized", mesh, metrics
+
     def normalize_obj_center_and_scale(
+        self,
         src_obj_path: Path,
         dst_obj_path: Path,
         *,
@@ -297,86 +507,55 @@ class BaseIngestAdapter(ABC):
 
         Used by / 用于: ShapeNetCore, ShapeNetSem, DGN, DDG.
         """
-        metrics: dict[str, float] = {}
-        try:
-            import trimesh  # type: ignore
-        except Exception as e:
-            return False, f"trimesh unavailable: {e}", metrics
-
-        try:
-            mesh = trimesh.load(
-                str(src_obj_path),
-                force="mesh",
-                process=False,
-                maintain_order=True,
-            )
-        except Exception as e:
-            return False, f"failed to load obj: {e}", metrics
-
-        if not isinstance(mesh, trimesh.Trimesh) or mesh.vertices is None or len(mesh.vertices) == 0:
-            return False, "loaded object has no valid mesh vertices", metrics
-        if mesh.faces is None or len(mesh.faces) == 0:
-            return False, "loaded object has no valid mesh faces", metrics
-
-        try:
-            pre_vertex_count = int(len(mesh.vertices))
-            mesh = mesh.copy()
-            mesh.remove_unreferenced_vertices()
-        except Exception as e:
-            return False, f"failed to remove unreferenced vertices: {e}", metrics
-
-        if mesh.vertices is None or len(mesh.vertices) == 0:
-            return False, "mesh has no vertices after cleanup", metrics
-        if mesh.faces is None or len(mesh.faces) == 0:
-            return False, "mesh has no faces after cleanup", metrics
-
-        bounds = mesh.bounds
-        if bounds is None or len(bounds) != 2:
-            return False, "mesh has invalid bounds after cleanup", metrics
-
-        extent = bounds[1] - bounds[0]
-        if not all(math.isfinite(float(x)) for x in extent):
-            return False, "non-finite bounds extent", metrics
-
-        pre_max_extent = float(max(extent))
-        pre_min_extent = float(min(extent))
-        pre_aspect_ratio = float(pre_max_extent / max(pre_min_extent, min_extent_eps))
-        metrics["pre_max_extent"] = pre_max_extent
-        metrics["pre_min_extent"] = pre_min_extent
-        metrics["pre_aspect_ratio"] = pre_aspect_ratio
-        metrics["kept_vertex_count"] = float(len(mesh.vertices))
-        metrics["dropped_unreferenced_vertices"] = float(pre_vertex_count - len(mesh.vertices))
-
-        if pre_max_extent <= min_extent_eps:
-            return False, f"degenerate mesh extent: max_extent={pre_max_extent:.3e}", metrics
-        if pre_aspect_ratio > max_aspect_ratio:
-            return (
-                False,
-                (
-                    "extreme aspect ratio before normalization: "
-                    f"{pre_aspect_ratio:.3e} > {max_aspect_ratio:.3e}"
-                ),
-                metrics,
-            )
-
-        center = mesh.bounding_box.centroid
-        scale = float(target_max_extent / pre_max_extent)
-
-        try:
-            mesh.apply_translation(-center)
-            mesh.apply_scale(scale)
-        except Exception as e:
-            return False, f"failed to normalize mesh transform: {e}", metrics
+        ok, msg, mesh, metrics = self.load_normalized_obj_mesh(
+            src_obj_path,
+            target_max_extent=target_max_extent,
+            min_extent_eps=min_extent_eps,
+            max_aspect_ratio=max_aspect_ratio,
+        )
+        if not ok or mesh is None:
+            return False, msg, metrics
 
         dst_obj_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            mesh.export(str(dst_obj_path))
+            self.export_trimesh_obj_assets(
+                mesh,
+                dst_obj_path.parent,
+                export_texture=False,
+                obj_name=dst_obj_path.name,
+            )
         except Exception as e:
             return False, f"failed to export normalized obj: {e}", metrics
 
-        post_metrics = BaseIngestAdapter._read_obj_bbox_metrics(dst_obj_path)
+        ok_post, post_reason = self.validate_normalized_obj_export(
+            dst_obj_path,
+            target_max_extent=target_max_extent,
+            metrics=metrics,
+        )
+        if not ok_post:
+            return False, post_reason, metrics
+
+        return True, "normalized", metrics
+
+    def validate_normalized_obj_export(
+        self,
+        obj_path: Path,
+        *,
+        target_max_extent: float = 1.0,
+        metrics: dict[str, float] | None = None,
+    ) -> tuple[bool, str]:
+        """
+        EN: Validate the exported normalized OBJ against size/center expectations.
+        ZH: 校验归一化导出的 OBJ 是否满足尺寸与中心约束。
+
+        Used by / 用于: normalized organize export for DGN and wrapper normalization helper.
+        """
+        if metrics is None:
+            metrics = {}
+
+        post_metrics = self._read_obj_bbox_metrics(obj_path)
         if post_metrics is None:
-            return False, "normalized obj has invalid bbox metrics", metrics
+            return False, "normalized obj has invalid bbox metrics"
 
         post_max_extent = float(post_metrics["max_extent"])
         post_center = [
@@ -395,28 +574,18 @@ class BaseIngestAdapter(ABC):
         metrics["post_center_norm"] = post_center_norm
 
         if not (0.95 * target_max_extent <= post_max_extent <= 1.05 * target_max_extent):
-            return (
-                False,
-                (
-                    "normalized size out of expected range: "
-                    f"post_max_extent={post_max_extent:.6f}, target={target_max_extent:.6f}"
-                ),
-                metrics,
+            return False, (
+                "normalized size out of expected range: "
+                f"post_max_extent={post_max_extent:.6f}, target={target_max_extent:.6f}"
             )
         if post_center_norm > 5e-3:
-            return (
-                False,
-                (
-                    "normalized center drift too large: "
-                    f"center_norm={post_center_norm:.6e}"
-                ),
-                metrics,
+            return False, (
+                "normalized center drift too large: "
+                f"center_norm={post_center_norm:.6e}"
             )
+        return True, "normalized"
 
-        return True, "normalized", metrics
-
-    @staticmethod
-    def _read_obj_bbox_metrics(obj_path: Path) -> dict[str, float] | None:
+    def _read_obj_bbox_metrics(self, obj_path: Path) -> dict[str, float] | None:
         """
         EN: Read per-axis bbox size, max extent, and bbox volume from OBJ vertices.
         ZH: 从 OBJ 顶点读取包围盒三轴尺寸、最大边长和包围盒体积。
@@ -430,7 +599,7 @@ class BaseIngestAdapter(ABC):
         try:
             with obj_path.open("r", encoding="utf-8", errors="ignore") as f:
                 for line in f:
-                    xyz = BaseIngestAdapter._parse_obj_vertex_xyz(line)
+                    xyz = self._parse_obj_vertex_xyz(line)
                     if xyz is None:
                         continue
                     for axis, value in enumerate(xyz):
@@ -461,8 +630,7 @@ class BaseIngestAdapter(ABC):
             "volume": float(extents[0] * extents[1] * extents[2]),
         }
 
-    @staticmethod
-    def _format_bbox_record(note_prefix: str, record: dict[str, Any]) -> str:
+    def _format_bbox_record(self, note_prefix: str, record: dict[str, Any]) -> str:
         """
         EN: Format one bbox summary line for organize report notes.
         ZH: 将单条 bbox 极值统计格式化为 organize report 的说明文本。
@@ -549,8 +717,7 @@ class BaseIngestAdapter(ABC):
                 self._format_bbox_record(f"{label} bbox max volume", max_volume_rec)
             )
 
-    @staticmethod
-    def default_manifest_path(cfg: IngestConfig) -> Path:
+    def default_manifest_path(self, cfg: IngestConfig) -> Path:
         """
         EN: Return the default manifest output path for the adapter's primary dataset.
         ZH: 返回当前 adapter 主数据集的默认 manifest 路径。
@@ -645,32 +812,6 @@ def download_url_file(url: str, output_path: Path, desc: str | None = None) -> N
         pbar.close()
 
 
-def copy_file_with_progress(src_path: Path, dst_path: Path, desc: str | None = None) -> None:
-    """Copy large file with tqdm progress bar."""
-    dst_path.parent.mkdir(parents=True, exist_ok=True)
-    total = src_path.stat().st_size
-    pbar = None
-    if tqdm is not None:
-        pbar = tqdm(
-            total=total,
-            unit="B",
-            unit_scale=True,
-            unit_divisor=1024,
-            desc=desc or f"copy {src_path.name}",
-            leave=True,
-        )
-    with open(src_path, "rb") as fsrc, open(dst_path, "wb") as fdst:
-        while True:
-            chunk = fsrc.read(1024 * 1024)
-            if not chunk:
-                break
-            fdst.write(chunk)
-            if pbar is not None:
-                pbar.update(len(chunk))
-    if pbar is not None:
-        pbar.close()
-
-
 def extract_zip(
     zip_path: Path,
     output_dir: Path,
@@ -694,185 +835,3 @@ def extract_zip(
         if bar is not None:
             bar.close()
     return output_dir
-
-
-def _read_text_lossy(path: Path) -> str:
-    try:
-        return path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        return path.read_text(encoding="latin-1")
-
-
-def _write_text(path: Path, text: str) -> None:
-    path.write_text(text, encoding="utf-8")
-
-
-def detect_obj_material_name(obj_path: Path) -> str | None:
-    """Return first 'usemtl' material name in OBJ, if present."""
-    if not obj_path.exists():
-        return None
-    for line in _read_text_lossy(obj_path).splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        if stripped.lower().startswith("usemtl "):
-            parts = stripped.split(maxsplit=1)
-            if len(parts) == 2 and parts[1].strip():
-                return parts[1].strip()
-    return None
-
-
-def rewrite_obj_material_refs(
-    obj_path: Path,
-    mtl_name: str = CANONICAL_MTL_NAME,
-    ensure_usemtl: str | None = None,
-) -> None:
-    """Rewrite OBJ to reference canonical MTL file, and optionally ensure one usemtl."""
-    if not obj_path.exists():
-        return
-    lines = _read_text_lossy(obj_path).splitlines()
-    out: list[str] = []
-    saw_mtllib = False
-    saw_usemtl = False
-
-    for line in lines:
-        stripped = line.strip()
-        low = stripped.lower()
-        if low.startswith("mtllib "):
-            if not saw_mtllib:
-                out.append(f"mtllib {mtl_name}")
-                saw_mtllib = True
-            continue
-        if low.startswith("usemtl "):
-            saw_usemtl = True
-        out.append(line)
-
-    if not saw_mtllib:
-        out.insert(0, f"mtllib {mtl_name}")
-
-    if ensure_usemtl and not saw_usemtl:
-        insert_at = 1 if out and out[0].lower().startswith("mtllib ") else 0
-        out.insert(insert_at, f"usemtl {ensure_usemtl}")
-
-    _write_text(obj_path, "\n".join(out) + "\n")
-
-
-def write_canonical_mtl(
-    dst_mtl_path: Path,
-    material_name: str,
-    texture_name: str = CANONICAL_TEXTURE_NAME,
-) -> None:
-    content = (
-        f"newmtl {material_name}\n"
-        "# shader_type beckmann\n"
-        f"map_Kd {texture_name}\n"
-    )
-    _write_text(dst_mtl_path, content)
-
-
-def rewrite_mtl_to_canonical_texture(
-    src_mtl_path: Path,
-    dst_mtl_path: Path,
-    material_name: str,
-    texture_name: str = CANONICAL_TEXTURE_NAME,
-) -> None:
-    """Rewrite MTL with canonical material + texture map filename."""
-    lines = _read_text_lossy(src_mtl_path).splitlines()
-    out: list[str] = []
-    saw_newmtl = False
-    saw_map_kd = False
-
-    for line in lines:
-        stripped = line.strip()
-        low = stripped.lower()
-        if low.startswith("newmtl "):
-            if not saw_newmtl:
-                out.append(f"newmtl {material_name}")
-                saw_newmtl = True
-            continue
-        if low.startswith("map_kd "):
-            out.append(f"map_Kd {texture_name}")
-            saw_map_kd = True
-            continue
-        out.append(line)
-
-    if not saw_newmtl:
-        out.insert(0, f"newmtl {material_name}")
-    if not saw_map_kd:
-        out.append(f"map_Kd {texture_name}")
-
-    _write_text(dst_mtl_path, "\n".join(out) + "\n")
-
-
-def canonicalize_texture_assets(
-    dst_dir: Path,
-    raw_obj_path: Path,
-    texture_src: Path | None = None,
-    mtl_src: Path | None = None,
-    create_mtl_if_texture: bool = False,
-    default_material_name: str = "material_0",
-) -> tuple[Path | None, Path | None]:
-    """Normalize optional texture assets to texture_map.png and textured.mtl."""
-    dst_dir.mkdir(parents=True, exist_ok=True)
-    dst_tex_path: Path | None = None
-    dst_mtl_path: Path | None = None
-
-    # Resolve source texture: explicit > existing texture_map.png > first png in dst dir.
-    if texture_src is None:
-        maybe_tex = dst_dir / CANONICAL_TEXTURE_NAME
-        if maybe_tex.exists():
-            texture_src = maybe_tex
-        else:
-            pngs = sorted(p for p in dst_dir.glob("*.png") if p.name != CANONICAL_TEXTURE_NAME)
-            if pngs:
-                texture_src = pngs[0]
-    if texture_src is not None and texture_src.exists():
-        dst_tex_path = dst_dir / CANONICAL_TEXTURE_NAME
-        if texture_src.resolve() != dst_tex_path.resolve():
-            shutil.copy2(texture_src, dst_tex_path)
-
-    material_name = detect_obj_material_name(raw_obj_path) or default_material_name
-
-    # Resolve source mtl: explicit > existing canonical mtl > first mtl in dst dir.
-    if mtl_src is None:
-        maybe_mtl = dst_dir / CANONICAL_MTL_NAME
-        if maybe_mtl.exists():
-            mtl_src = maybe_mtl
-        else:
-            mtls = sorted(p for p in dst_dir.glob("*.mtl") if p.name != CANONICAL_MTL_NAME)
-            if mtls:
-                mtl_src = mtls[0]
-
-    if dst_tex_path is not None:
-        dst_mtl_path = dst_dir / CANONICAL_MTL_NAME
-        if mtl_src is not None and mtl_src.exists():
-            rewrite_mtl_to_canonical_texture(
-                src_mtl_path=mtl_src,
-                dst_mtl_path=dst_mtl_path,
-                material_name=material_name,
-                texture_name=CANONICAL_TEXTURE_NAME,
-            )
-        elif create_mtl_if_texture:
-            write_canonical_mtl(
-                dst_mtl_path=dst_mtl_path,
-                material_name=material_name,
-                texture_name=CANONICAL_TEXTURE_NAME,
-            )
-        else:
-            dst_mtl_path = None
-
-    # Clean non-canonical texture/material files in organized output dir.
-    for p in sorted(dst_dir.glob("*.png")):
-        if p.name != CANONICAL_TEXTURE_NAME:
-            p.unlink(missing_ok=True)
-    for p in sorted(dst_dir.glob("*.mtl")):
-        if p.name != CANONICAL_MTL_NAME:
-            p.unlink(missing_ok=True)
-
-    if dst_mtl_path is not None and dst_mtl_path.exists():
-        rewrite_obj_material_refs(
-            obj_path=raw_obj_path,
-            mtl_name=CANONICAL_MTL_NAME,
-            ensure_usemtl=material_name,
-        )
-    return dst_tex_path, dst_mtl_path

@@ -106,16 +106,24 @@ class ObjectDescriptionBuilder:
             except Exception:
                 raise RuntimeError(f"{object_id}: non-numeric principal_moments={pm}")
 
-            png_tex = obj_dir / "visual_texture_map.png"
-            jpg_tex = obj_dir / "visual_texture_map.jpg"
-            jpeg_tex = obj_dir / "visual_texture_map.jpeg"
-            has_png = png_tex.exists()
-            has_jpg = jpg_tex.exists() or jpeg_tex.exists()
-            if has_jpg and not has_png:
+            visual_png = obj_dir / "textured_visual.png"
+            visual_jpegs = sorted(
+                [p for p in obj_dir.glob("*_visual.jpg") if p.is_file()]
+                + [p for p in obj_dir.glob("*_visual.jpeg") if p.is_file()]
+            )
+            if visual_jpegs and not visual_png.exists():
                 raise RuntimeError(
-                    f"{object_id}: non-png visual texture found; expected visual_texture_map.png only"
+                    f"{object_id}: non-png visual texture found; expected textured_visual.png only"
                 )
-            visual_texture_rel = "visual_texture_map.png" if has_png else None
+            extra_pngs = sorted(
+                p for p in obj_dir.glob("*_visual.png")
+                if p.is_file() and p.name != "textured_visual.png"
+            )
+            if extra_pngs:
+                raise RuntimeError(
+                    f"{object_id}: unexpected extra visual textures found; expected only textured_visual.png"
+                )
+            visual_texture_rel = visual_png.name if visual_png.exists() else None
 
             specs.append(
                 ObjectSpec(

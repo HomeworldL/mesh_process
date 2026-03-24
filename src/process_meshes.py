@@ -6,7 +6,9 @@ Stage-2 mesh processing for organized datasets under:
 Pipeline per object:
   1) mesh_manifold_and_convex_decomp -> manifold.obj + coacd.obj
   2) principal-frame transform from manifold.obj (overwrite manifold.obj)
-  3) transform raw.obj with same transform -> visual.obj + visual.mtl + visual_texture_map.png
+  3) transform raw.obj with same transform -> visual.obj
+     - untextured input: simplify geometry with trimesh
+     - textured input: keep geometry, only compress texture and rewrite visual sidecars
   4) transform coacd.obj with same transform -> meshes/*.obj
   5) mesh_simplify -> simplified.obj
 
@@ -31,12 +33,6 @@ import numpy as np
 import trimesh
 from trimesh.exchange.obj import export_obj
 from trimesh.exchange.export import export_mesh
-try:
-    import pymeshlab  # type: ignore
-except Exception as e:  # pragma: no cover
-    raise ImportError(
-        "process_meshes.py requires pymeshlab. Install with: pip install pymeshlab"
-    ) from e
 
 try:
     from PIL import Image
@@ -56,25 +52,17 @@ _re_f = re.compile(r"^\s*f\s+")
 _re_mtllib = re.compile(r"^(\s*)mtllib\s+(.+)$", re.IGNORECASE)
 _re_usemtl = re.compile(r"^\s*usemtl\s+(.+)$", re.IGNORECASE)
 
+TEXTURED_INPUT_MTL = "textured.mtl"
+TEXTURED_INPUT_PNG = "textured.png"
+VISUAL_TEXTURED_MTL = "textured_visual.mtl"
+VISUAL_TEXTURED_PNG = "textured_visual.png"
+
 
 # -------------------------
 # Helpers (copied/adapted from your provided code)
 # -------------------------
 def ensure_dir(p):
     os.makedirs(p, exist_ok=True)
-
-
-def parse_mtllibs(obj_path):
-    libs = []
-    try:
-        with open(obj_path, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                m = _re_mtllib.match(line)
-                if m:
-                    libs.append(m.group(2).strip())
-    except Exception:
-        pass
-    return libs
 
 
 def parse_first_usemtl(obj_path):
@@ -110,48 +98,6 @@ def parse_first_newmtl(mtl_path):
     return None
 
 
-def parse_first_texture_from_mtl(mtl_path):
-    if not os.path.exists(mtl_path):
-        return None
-    try:
-        with open(mtl_path, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                s = line.strip()
-                if not s:
-                    continue
-                lower = s.lower()
-                if lower.startswith("map_kd "):
-                    parts = s.split(maxsplit=1)
-                    if len(parts) == 2:
-                        return parts[1].strip()
-    except Exception:
-        pass
-    return None
-
-
-def parse_texture_refs_from_mtl(mtl_path):
-    refs = []
-    if not os.path.exists(mtl_path):
-        return refs
-    try:
-        with open(mtl_path, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                s = line.strip()
-                if not s or s.startswith("#"):
-                    continue
-                parts = s.split()
-                if len(parts) < 2:
-                    continue
-                key = parts[0].lower()
-                if key.startswith("map_") or key == "bump":
-                    tex = os.path.basename(parts[-1].strip())
-                    if tex and tex not in refs:
-                        refs.append(tex)
-    except Exception:
-        pass
-    return refs
-
-
 def rewrite_visual_mtl_with_texture_map(src_mtl, dst_mtl, remap):
     """Rewrite map_* and bump texture filenames in MTL using remap dict."""
     if not os.path.exists(src_mtl):
@@ -179,73 +125,6 @@ def rewrite_visual_mtl_with_texture_map(src_mtl, dst_mtl, remap):
     with open(dst_mtl, "w", encoding="utf-8") as f:
         f.writelines(out_lines)
     return rewritten
-
-
-def copy_and_patch_mtl(src_obj, dst_obj_dir):
-    """
-    Copy mtls referenced by src_obj into dst_obj_dir.
-    For each mtl, rewrite texture lines to use basenames and copy textures.
-    Return mapping: original_mtllib_token_in_obj -> basename_written_in_dst
-    """
-    mapping = {}
-    src_dir = os.path.dirname(src_obj)
-    mtllibs = parse_mtllibs(src_obj)
-    for lib in mtllibs:
-        src_mtl = os.path.join(src_dir, lib)
-        if not os.path.exists(src_mtl):
-            src_mtl = os.path.join(src_dir, os.path.basename(lib))
-            if not os.path.exists(src_mtl):
-                continue
-
-        dst_mtl_basename = os.path.basename(src_mtl)
-        dst_mtl = os.path.join(dst_obj_dir, dst_mtl_basename)
-
-        out_lines = []
-        try:
-            with open(src_mtl, "r", encoding="utf-8", errors="ignore") as fin:
-                for line in fin:
-                    stripped = line.strip()
-                    # texture tokens to handle
-                    if stripped.lower().startswith(
-                        ("map_kd ", "map_ka ", "map_d ", "map_bump ", "bump ")
-                    ):
-                        parts = stripped.split(maxsplit=1)
-                        if len(parts) > 1:
-                            tex_rel = parts[1].strip()
-                            src_tex = os.path.join(os.path.dirname(src_mtl), tex_rel)
-                            if not os.path.exists(src_tex):
-                                src_tex = os.path.join(src_dir, tex_rel)
-                            if os.path.exists(src_tex):
-                                dst_tex = os.path.join(
-                                    dst_obj_dir, os.path.basename(src_tex)
-                                )
-                                try:
-                                    shutil.copy2(src_tex, dst_tex)
-                                except Exception:
-                                    pass
-                                out_lines.append(
-                                    f"{parts[0]} {os.path.basename(src_tex)}\n"
-                                )
-                                continue
-                            else:
-                                out_lines.append(line)
-                                continue
-                        else:
-                            out_lines.append(line)
-                    else:
-                        out_lines.append(line)
-        except Exception:
-            continue
-
-        try:
-            ensure_dir(dst_obj_dir)
-            with open(dst_mtl, "w", encoding="utf-8", errors="ignore") as fout:
-                fout.writelines(out_lines)
-            mapping[lib] = dst_mtl_basename
-        except Exception:
-            pass
-
-    return mapping
 
 
 def _flip_face_winding(line: str) -> str:
@@ -429,6 +308,14 @@ def mesh_manifold_and_convex_decomp(
     return ret
 
 
+def describe_subprocess_returncode(tool_name: str, ret: int, timeout_sec=None) -> str:
+    if int(ret) == 124:
+        if timeout_sec:
+            return f"{tool_name} timed out after {float(timeout_sec):.1f}s (ret=124)"
+        return f"{tool_name} timed out (ret=124)"
+    return f"{tool_name} failed (ret={int(ret)})"
+
+
 def mesh_simplify(input_path, output_path, vert_num=4000, gradation=0.5, quiet=False, timeout_sec=None):
     out_dir = os.path.dirname(output_path)
     out_basename = os.path.basename(output_path)
@@ -464,142 +351,45 @@ def mesh_simplify(input_path, output_path, vert_num=4000, gradation=0.5, quiet=F
     return ret
 
 
-def mesh_decimate_with_pymeshlab(src_obj, dst_obj, target_faces):
+def simplify_visual_obj_with_trimesh(src_obj, dst_obj, target_faces, decimals=6):
+    """Simplify untextured visual mesh with trimesh and export OBJ without `vn`/`vt`."""
     try:
-        ms = pymeshlab.MeshSet()
-        ms.load_new_mesh(str(src_obj))
-        try:
-            face_num = int(ms.current_mesh().face_number())
-        except Exception:
-            face_num = target_faces + 1
-        if face_num > int(target_faces):
-            filter_candidates = [
-                (
-                    "meshing_decimation_quadric_edge_collapse_with_texture",
-                    dict(targetfacenum=int(target_faces), preservenormal=True, preservetopology=True),
-                ),
-                (
-                    "meshing_decimation_quadric_edge_collapse",
-                    dict(targetfacenum=int(target_faces), preservenormal=True, preservetopology=True),
-                ),
-            ]
-            applied = False
-            for filter_name, kwargs in filter_candidates:
-                try:
-                    ms.apply_filter(filter_name, **kwargs)
-                    applied = True
-                    break
-                except Exception:
-                    continue
-            if not applied:
-                raise RuntimeError("pymeshlab decimation filters unavailable")
-        ms.save_current_mesh(str(dst_obj))
-        return None
+        mesh = trimesh.load(str(src_obj))
     except Exception as e:
-        raise RuntimeError(f"pymeshlab decimation failed: {e}") from e
-
-
-def mesh_slim_obj_text(src_obj, dst_obj, decimals=6, force_mtllib=None, force_usemtl=None):
-    fmt = "{:." + str(int(decimals)) + "f}"
-    out_lines = []
-    saw_mtllib = False
-    saw_usemtl = False
-    try:
-        with open(src_obj, "r", encoding="utf-8", errors="ignore") as fin:
-            for line in fin:
-                s = line.strip()
-                if not s or s.startswith("#"):
-                    continue
-                m = _re_mtllib.match(line)
-                if m:
-                    if force_mtllib is not None:
-                        if not saw_mtllib:
-                            out_lines.append(f"mtllib {force_mtllib}\n")
-                            saw_mtllib = True
-                    else:
-                        out_lines.append(f"mtllib {os.path.basename(m.group(2).strip())}\n")
-                        saw_mtllib = True
-                    continue
-                m = _re_usemtl.match(line)
-                if m:
-                    saw_usemtl = True
-                    if force_usemtl is not None:
-                        out_lines.append(f"usemtl {force_usemtl}\n")
-                    else:
-                        out_lines.append(f"usemtl {m.group(1).strip()}\n")
-                    continue
-                m = _re_v.match(line)
-                if m:
-                    _, sx, sy, sz, rest = m.groups()
-                    out_lines.append(
-                        f"v {fmt.format(float(sx))} {fmt.format(float(sy))} {fmt.format(float(sz))}{rest}\n"
-                    )
-                    continue
-                m = _re_vn.match(line)
-                if m:
-                    _, sx, sy, sz, rest = m.groups()
-                    out_lines.append(
-                        f"vn {fmt.format(float(sx))} {fmt.format(float(sy))} {fmt.format(float(sz))}{rest}\n"
-                    )
-                    continue
-                m = _re_vt.match(line)
-                if m:
-                    _, su, sv, sw, rest = m.groups()
-                    if sw is None:
-                        out_lines.append(f"vt {fmt.format(float(su))} {fmt.format(float(sv))}{rest}\n")
-                    else:
-                        out_lines.append(
-                            f"vt {fmt.format(float(su))} {fmt.format(float(sv))} {fmt.format(float(sw))}{rest}\n"
-                        )
-                    continue
-                out_lines.append(s + "\n")
-    except Exception as e:
-        raise RuntimeError(f"OBJ slim failed: {e}") from e
-
-    if force_mtllib is not None and not saw_mtllib:
-        out_lines.insert(0, f"mtllib {force_mtllib}\n")
-    if force_usemtl is not None and not saw_usemtl:
-        insert_at = 1 if out_lines and out_lines[0].lower().startswith("mtllib ") else 0
-        out_lines.insert(insert_at, f"usemtl {force_usemtl}\n")
-
-    with open(dst_obj, "w", encoding="utf-8", errors="ignore") as fout:
-        fout.writelines(out_lines)
-
-
-def export_visual_obj_with_trimesh(
-    src_obj,
-    dst_obj,
-    *,
-    decimals=6,
-    mtl_name=None,
-    include_texture=False,
-):
-    """
-    Re-export a decimated OBJ through trimesh to normalize face/normal formatting.
-    """
-    try:
-        mesh = trimesh.load(str(src_obj), process=False, force="mesh", maintain_order=True)
-    except Exception as e:
-        raise RuntimeError(f"failed to load decimated visual OBJ {src_obj}: {e}") from e
+        raise RuntimeError(f"failed to load visual source OBJ {src_obj}: {e}") from e
 
     if isinstance(mesh, trimesh.Scene):
         if not getattr(mesh, "geometry", None):
-            raise RuntimeError(f"decimated visual OBJ loaded as empty scene: {src_obj}")
+            raise RuntimeError(f"visual source OBJ loaded as empty scene: {src_obj}")
         try:
             mesh = trimesh.util.concatenate(tuple(mesh.geometry.values()))
         except Exception as e:
             raise RuntimeError(f"failed to concatenate visual scene geometry {src_obj}: {e}") from e
 
     try:
+        face_num = int(len(mesh.faces))
+    except Exception:
+        face_num = int(target_faces) + 1
+    if face_num > int(target_faces):
+        try:
+            mesh = mesh.simplify_quadric_decimation(face_count=int(target_faces))
+        except ModuleNotFoundError as e:
+            raise RuntimeError(
+                "trimesh visual decimation requires the optional package "
+                "`fast_simplification`; install it to process untextured visual meshes"
+            ) from e
+        except Exception as e:
+            raise RuntimeError(f"trimesh visual decimation failed: {e}") from e
+
+    try:
         obj_text = export_obj(
             mesh,
-            include_normals=True,
-            include_texture=bool(include_texture),
-            mtl_name=mtl_name,
+            include_normals=False,
+            include_texture=False,
             digits=int(decimals),
         )
     except Exception as e:
-        raise RuntimeError(f"failed to export normalized visual OBJ {dst_obj}: {e}") from e
+        raise RuntimeError(f"failed to export trimesh visual OBJ {dst_obj}: {e}") from e
 
     try:
         with open(dst_obj, "w", encoding="utf-8", errors="ignore") as fout:
@@ -608,7 +398,7 @@ def export_visual_obj_with_trimesh(
         raise RuntimeError(f"failed writing visual OBJ {dst_obj}: {e}") from e
 
 
-def mesh_compress_texture(src_tex, dst_tex, max_size=1024, jpg_quality=85):
+def mesh_compress_texture(src_tex, dst_tex, max_size=1024):
     with Image.open(src_tex) as img:
         img = img.convert("RGBA") if img.mode in ("P", "LA") else img
         w, h = img.size
@@ -619,26 +409,108 @@ def mesh_compress_texture(src_tex, dst_tex, max_size=1024, jpg_quality=85):
             resample = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
             img = img.resize((nw, nh), resample)
 
-        ext = os.path.splitext(dst_tex)[1].lower()
-        if ext in (".jpg", ".jpeg"):
-            # Keep alpha-safe fallback.
-            if "A" in img.getbands():
-                dst_png = os.path.splitext(dst_tex)[0] + ".png"
-                img.save(dst_png, format="PNG", optimize=True, compress_level=9)
-                return {"texture_mode": "png_fallback_alpha", "texture_path": dst_png}
-            img = img.convert("RGB")
-            img.save(dst_tex, format="JPEG", quality=int(jpg_quality), optimize=True, progressive=True)
-            return {"texture_mode": "jpeg", "texture_path": dst_tex}
-
         img.save(dst_tex, format="PNG", optimize=True, compress_level=9)
         return {"texture_mode": "png", "texture_path": dst_tex}
+
+
+def resolve_textured_input(obj_dir: Path) -> tuple[Path, Path] | None:
+    mtl = obj_dir / TEXTURED_INPUT_MTL
+    tex = obj_dir / TEXTURED_INPUT_PNG
+    if (
+        mtl.is_file()
+        and mtl.stat().st_size > 0
+        and tex.is_file()
+        and tex.stat().st_size > 0
+    ):
+        return mtl, tex
+    return None
+
+
+def resolve_visual_texture_output(obj_dir: Path) -> Path | None:
+    path = obj_dir / VISUAL_TEXTURED_PNG
+    return path if path.is_file() else None
+
+
+def resolve_visual_mtl_output(obj_dir: Path) -> Path | None:
+    path = obj_dir / VISUAL_TEXTURED_MTL
+    return path if path.is_file() else None
+
+
+def build_textured_visual(obj_dir: Path, src_obj: Path, args):
+    visual_obj = obj_dir / "visual.obj"
+    textured_input = resolve_textured_input(obj_dir)
+    if textured_input is None:
+        raise RuntimeError(f"missing textured input assets under {obj_dir}")
+    src_mtl, src_tex = textured_input
+    visual_mtl = obj_dir / VISUAL_TEXTURED_MTL
+    visual_tex = obj_dir / VISUAL_TEXTURED_PNG
+    visual_mtl.unlink(missing_ok=True)
+    visual_tex.unlink(missing_ok=True)
+
+    texture_info = mesh_compress_texture(
+        str(src_tex),
+        str(visual_tex),
+        max_size=int(args.visual_texture_max_size),
+    )
+    produced_visual_texture = Path(texture_info["texture_path"])
+    remap = {src_tex.name: produced_visual_texture.name}
+
+    material_name = parse_first_usemtl(str(src_obj)) or parse_first_newmtl(str(src_mtl)) or "material_0"
+    rewritten = rewrite_visual_mtl_with_texture_map(str(src_mtl), str(visual_mtl), remap)
+    if rewritten:
+        first_newmtl = parse_first_newmtl(str(visual_mtl))
+        if first_newmtl:
+            material_name = first_newmtl
+    else:
+        with open(visual_mtl, "w", encoding="utf-8") as f:
+            f.write(f"newmtl {material_name}\n")
+            f.write("# shader_type beckmann\n")
+            f.write(f"map_Kd {produced_visual_texture.name}\n")
+
+    transform_obj_text(
+        str(src_obj),
+        str(visual_obj),
+        np.eye(4, dtype=float),
+        mtllib_map={TEXTURED_INPUT_MTL: VISUAL_TEXTURED_MTL},
+        flip_faces=False,
+        flip_normals=False,
+    )
+
+    return {
+        "visual_obj": str(visual_obj),
+        "visual_mtl": str(visual_mtl),
+        "visual_texture": str(produced_visual_texture),
+        "decimated_with": "none",
+        "decimate_note": None,
+        "texture_mode": texture_info.get("texture_mode"),
+    }
+
+
+def build_untextured_visual(obj_dir: Path, src_obj: Path, args):
+    visual_obj = obj_dir / "visual.obj"
+    simplify_visual_obj_with_trimesh(
+        src_obj=str(src_obj),
+        dst_obj=str(visual_obj),
+        target_faces=int(args.visual_target_faces),
+        decimals=int(args.visual_obj_decimals),
+    )
+    (obj_dir / VISUAL_TEXTURED_MTL).unlink(missing_ok=True)
+    (obj_dir / VISUAL_TEXTURED_PNG).unlink(missing_ok=True)
+    return {
+        "visual_obj": str(visual_obj),
+        "visual_mtl": None,
+        "visual_texture": None,
+        "decimated_with": "trimesh",
+        "decimate_note": None,
+        "texture_mode": "none",
+    }
 
 
 def mesh_visual(obj_dir, args, src_obj: str | Path | None = None):
     """
     Build compressed visual assets for MuJoCo loading speed:
       source OBJ (default raw.obj) -> visual.obj
-      textured.mtl/texture_map.png -> visual.mtl + visual_texture_map.png
+      textured source keeps geometry and only rewrites visual sidecars.
     This function never overwrites raw.obj.
     """
     obj_dir = Path(obj_dir)
@@ -649,107 +521,9 @@ def mesh_visual(obj_dir, args, src_obj: str | Path | None = None):
     if not src_obj.exists():
         raise RuntimeError(f"source obj missing: {src_obj}")
 
-    visual_obj = obj_dir / "visual.obj"
-    tmp_decimated = obj_dir / "visual.decimated.tmp.obj"
-    visual_mtl = obj_dir / "visual.mtl"
-    for stale in list(obj_dir.glob("visual_texture_map*.jpg")) + list(obj_dir.glob("visual_texture_map*.png")):
-        stale.unlink(missing_ok=True)
-
-    # Step A: geometry compression (prefer texture-aware pymeshlab).
-    mesh_decimate_with_pymeshlab(
-        src_obj=src_obj,
-        dst_obj=tmp_decimated,
-        target_faces=int(args.visual_target_faces),
-    )
-
-    # Step B: canonical single-texture discovery.
-    src_mtl = obj_dir / "textured.mtl"
-    tex_name = None
-    tex_in_mtl = parse_first_texture_from_mtl(str(src_mtl)) if src_mtl.exists() else None
-    if tex_in_mtl:
-        tex_name = os.path.basename(tex_in_mtl)
-    elif (obj_dir / "texture_map.png").exists():
-        tex_name = "texture_map.png"
-
-    # Step C: texture compression to one visual texture.
-    # MuJoCo texture loading expects PNG in this project pipeline.
-    dst_tex_ext = ".png"
-    texture_info = {"texture_mode": "none", "texture_path": None}
-    produced_visual_textures = []
-    remap = {}
-    if tex_name is not None:
-        src_tex = obj_dir / os.path.basename(tex_name)
-        if src_tex.exists():
-            dst_tex = obj_dir / f"visual_texture_map{dst_tex_ext}"
-            info = mesh_compress_texture(
-                str(src_tex),
-                str(dst_tex),
-                max_size=int(args.visual_texture_max_size),
-                jpg_quality=int(args.visual_jpeg_quality),
-            )
-            tex_path = info.get("texture_path")
-            if tex_path:
-                out_name = Path(tex_path).name
-                remap[os.path.basename(tex_name)] = out_name
-                produced_visual_textures.append(Path(tex_path))
-                texture_info = info
-
-    # Step D: write visual.mtl when texture exists.
-    material_name = parse_first_usemtl(str(tmp_decimated))
-    if not material_name:
-        material_name = "material_0"
-    if produced_visual_textures:
-        rewritten = False
-        if src_mtl.exists():
-            rewritten = rewrite_visual_mtl_with_texture_map(str(src_mtl), str(visual_mtl), remap)
-            if rewritten:
-                first_newmtl = parse_first_newmtl(str(visual_mtl))
-                if first_newmtl:
-                    # Keep visual.obj/usemtl consistent with rewritten visual.mtl.
-                    material_name = first_newmtl
-        if not rewritten:
-            tex_name = produced_visual_textures[0].name
-            with open(visual_mtl, "w", encoding="utf-8") as f:
-                f.write(f"newmtl {material_name}\n")
-                f.write("# shader_type beckmann\n")
-                f.write(f"map_Kd {tex_name}\n")
-        force_mtllib = visual_mtl.name
-    else:
-        force_mtllib = None
-        if visual_mtl.exists():
-            visual_mtl.unlink(missing_ok=True)
-
-    # Step E: canonical OBJ export through trimesh after decimation.
-    export_visual_obj_with_trimesh(
-        src_obj=str(tmp_decimated),
-        dst_obj=str(visual_obj),
-        decimals=int(args.visual_obj_decimals),
-        mtl_name=force_mtllib,
-        include_texture=force_mtllib is not None,
-    )
-    tmp_decimated.unlink(missing_ok=True)
-    (obj_dir / f"{tmp_decimated.name}.mtl").unlink(missing_ok=True)
-
-    return {
-        "visual_obj": str(visual_obj),
-        "visual_mtl": str(visual_mtl) if visual_mtl.exists() else None,
-        "visual_texture": str(produced_visual_textures[0]) if produced_visual_textures else None,
-        "decimated_with": "pymeshlab",
-        "decimate_note": None,
-        "texture_mode": texture_info.get("texture_mode"),
-    }
-
-
-# -------------------------
-# High-level pipeline steps
-# -------------------------
-def preview_obj(dst_obj):
-    try:
-        scene = trimesh.load(dst_obj, force="scene")
-        print("  Preview (close viewer to continue)...")
-        scene.show()
-    except Exception as e:
-        print("  Preview failed (likely headless):", e)
+    if resolve_textured_input(obj_dir) is not None:
+        return build_textured_visual(obj_dir=obj_dir, src_obj=src_obj, args=args)
+    return build_untextured_visual(obj_dir=obj_dir, src_obj=src_obj, args=args)
 
 
 def compute_principal_transform(
@@ -768,7 +542,7 @@ def compute_principal_transform(
     """
     # load mesh using trimesh (no processing)
     try:
-        mesh = trimesh.load(src_obj, process=False)
+        mesh = trimesh.load(src_obj)
         if isinstance(mesh, trimesh.Scene):
             mesh = (
                 trimesh.util.concatenate([g for g in mesh.geometry.values()])
@@ -783,6 +557,21 @@ def compute_principal_transform(
         vol = float(mesh.volume)
     except Exception:
         vol = np.nan
+
+    # Repair negative orientation before principal inertia computation.
+    flip_faces = bool(
+        np.isfinite(vol) and vol < 0.0
+    )
+    if flip_faces:
+        try:
+            mesh.invert()
+        except Exception:
+            pass
+        try:
+            vol = float(mesh.volume)
+        except Exception:
+            vol = np.nan
+
     if not np.isfinite(vol) or abs(vol) <= 1e-18:
         raise RuntimeError("invalid mesh volume for principal inertia computation")
     # Keep inertia scale consistent with manifest mass.
@@ -819,17 +608,6 @@ def compute_principal_transform(
         com = np.asarray(mesh.center_mass, dtype=float)
     except Exception as e:
         raise RuntimeError(f"failed to read center_mass: {e}") from e
-
-    # Repair negative orientation before principal inertia computation.
-    flip_faces = bool(
-        (np.isfinite(vol) and vol < 0.0)
-        or (np.isfinite(np.trace(I_world)) and float(np.trace(I_world)) < 0.0)
-    )
-    if flip_faces:
-        try:
-            mesh.invert()
-        except Exception:
-            pass
 
     # trimesh principal_inertia_transform is WORLD->PRINCIPAL.
     R_world_to_principal = pit[:3, :3]
@@ -922,15 +700,14 @@ def _validate_coacd_convex_piece(
 
 def _visual_outputs_exist(obj_dir: Path) -> bool:
     visual_obj = obj_dir / "visual.obj"
-    visual_mtl = obj_dir / "visual.mtl"
+    visual_mtl = resolve_visual_mtl_output(obj_dir)
     if (not visual_obj.exists()) or visual_obj.stat().st_size <= 0:
         return False
-    # For textured objects visual.mtl + visual_texture_map* are expected.
-    textured_mtl = obj_dir / "textured.mtl"
-    if textured_mtl.exists():
-        visual_tex = obj_dir / "visual_texture_map.png"
-        has_visual_tex = visual_tex.exists() and visual_tex.stat().st_size > 0
-        return visual_mtl.exists() and visual_mtl.stat().st_size > 0 and has_visual_tex
+    # For textured objects a rewritten visual MTL and compressed visual texture are expected.
+    if resolve_textured_input(obj_dir) is not None:
+        visual_tex = resolve_visual_texture_output(obj_dir)
+        has_visual_tex = visual_tex is not None and visual_tex.stat().st_size > 0
+        return visual_mtl is not None and visual_mtl.stat().st_size > 0 and has_visual_tex
     # For non-textured objects only visual.obj is required.
     return True
 
@@ -939,7 +716,7 @@ def validate_manifold_mesh(manifold_obj: Path) -> tuple[bool, str | None]:
     if (not manifold_obj.exists()) or manifold_obj.stat().st_size <= 0:
         return False, f"manifold.obj missing or empty: {manifold_obj}"
     try:
-        loaded = trimesh.load(str(manifold_obj), process=False)
+        loaded = trimesh.load(str(manifold_obj))
     except Exception as e:
         return False, f"failed to load manifold.obj: {e}"
     if isinstance(loaded, trimesh.Scene):
@@ -967,12 +744,18 @@ def validate_visual_obj_loadable(obj_dir: Path) -> tuple[bool, str | None]:
     if (not visual_obj.exists()) or visual_obj.stat().st_size <= 0:
         return False, f"visual.obj missing or empty: {visual_obj}"
     try:
-        scene = trimesh.load(str(visual_obj), process=False, force="scene")
+        loaded = trimesh.load(str(visual_obj))
     except Exception as e:
         return False, f"failed to load visual.obj: {e}"
-    geoms = getattr(scene, "geometry", {})
-    if not geoms:
-        return False, "visual.obj loaded as empty scene (no geometry)"
+    if isinstance(loaded, trimesh.Scene):
+        geoms = getattr(loaded, "geometry", {})
+        if not geoms:
+            return False, "visual.obj loaded as empty scene (no geometry)"
+        scene = loaded
+    else:
+        if getattr(loaded, "vertices", None) is None or len(loaded.vertices) == 0:
+            return False, "visual.obj loaded as empty mesh"
+        scene = loaded
     try:
         bounds = scene.bounds
     except Exception as e:
@@ -996,8 +779,8 @@ def detect_visual_needs_flip(
     Returns (needs_flip, debug_reason).
     """
     try:
-        manifold_mesh = trimesh.load(str(manifold_obj), process=False, force="mesh")
-        visual_mesh = trimesh.load(str(visual_obj), process=False, force="mesh")
+        manifold_mesh = trimesh.load(str(manifold_obj))
+        visual_mesh = trimesh.load(str(visual_obj))
     except Exception as e:
         return False, f"load failed: {e}"
 
@@ -1080,8 +863,8 @@ def process_object(
     }
 
     if not src_obj.exists():
-        rec["error"] = f"raw.obj missing: {src_obj}"
-        print(f"    ERROR: {rec['error']}")
+        rec["error"] = f"{object_id}: raw.obj missing: {src_obj}"
+        print(f"    ERROR [{object_id}]: {rec['error']}")
         return rec
 
     # Step 1: run CoACD once to produce manifold.obj and coacd.obj
@@ -1094,15 +877,28 @@ def process_object(
         )
         if need_joint_coacd:
             print("  running mesh_manifold_and_convex_decomp...")
+            coacd_timeout_sec = (
+                float(process_cfg["coacd_timeout_sec"])
+                if process_cfg["coacd_timeout_sec"]
+                else None
+            )
             ret = mesh_manifold_and_convex_decomp(
                 str(src_obj),
                 str(dst_manifold_obj),
                 str(dst_coacd_obj),
                 quiet=bool(process_cfg["coacd_quiet"]),
-                timeout_sec=float(process_cfg["coacd_timeout_sec"]) if process_cfg["coacd_timeout_sec"] else None,
+                timeout_sec=coacd_timeout_sec,
             )
             if ret != 0 or (not dst_manifold_obj.exists()) or (not dst_coacd_obj.exists()):
-                raise RuntimeError(f"CoACD manifold/convex failed (ret={ret})")
+                detail = describe_subprocess_returncode(
+                    "CoACD manifold/convex",
+                    ret,
+                    timeout_sec=coacd_timeout_sec,
+                )
+                raise RuntimeError(
+                    f"{detail}; manifold_exists={dst_manifold_obj.exists()} "
+                    f"coacd_exists={dst_coacd_obj.exists()}"
+                )
             ran_joint_coacd = True
         else:
             print("  manifold/coacd exist -> skip CoACD")
@@ -1110,8 +906,8 @@ def process_object(
         if not ok:
             raise RuntimeError(f"invalid manifold: {reason}")
     except Exception as e:
-        rec["error"] = f"manifold failed: {e}"
-        print(f"    ERROR: {rec['error']}")
+        rec["error"] = f"{object_id}: manifold failed: {e}"
+        print(f"    ERROR [{object_id}]: {rec['error']}")
         return rec
 
     # Step 2: principal-frame transform from manifold, overwrite manifold.obj
@@ -1141,11 +937,9 @@ def process_object(
         ok, reason = validate_manifold_mesh(dst_manifold_obj)
         if not ok:
             raise RuntimeError(f"transformed manifold invalid: {reason}")
-        if bool(process_cfg["preview"]):
-            preview_obj(str(dst_manifold_obj))
     except Exception as e:
-        rec["error"] = f"inertia failed: {e}"
-        print(f"    ERROR: {rec['error']}")
+        rec["error"] = f"{object_id}: inertia failed: {e}"
+        print(f"    ERROR [{object_id}]: {rec['error']}")
         return rec
     finally:
         tmp_manifold_aligned_obj.unlink(missing_ok=True)
@@ -1170,10 +964,8 @@ def process_object(
                 src_obj=str(tmp_raw_aligned_obj),
             )
         visual_obj = obj_dir / "visual.obj"
-        visual_mtl = obj_dir / "visual.mtl"
-        visual_tex = next(iter(sorted(obj_dir.glob("visual_texture_map*.png"))), None)
-        if visual_tex is None:
-            visual_tex = next(iter(sorted(obj_dir.glob("visual_texture_map*.jpg"))), None)
+        visual_mtl = resolve_visual_mtl_output(obj_dir)
+        visual_tex = resolve_visual_texture_output(obj_dir)
         needs_visual_flip, flip_reason = detect_visual_needs_flip(dst_manifold_obj, visual_obj)
         print(f"  visual orientation check: {flip_reason}")
         if needs_visual_flip:
@@ -1188,14 +980,18 @@ def process_object(
             )
             os.replace(str(tmp_visual_flipped_obj), str(visual_obj))
         rec["visual_obj_path"] = str(visual_obj) if visual_obj.exists() else None
-        rec["visual_mtl_path"] = str(visual_mtl) if visual_mtl.exists() else None
+        rec["visual_mtl_path"] = (
+            str(visual_mtl)
+            if (visual_mtl is not None and visual_mtl.exists())
+            else None
+        )
         rec["visual_texture_path"] = str(visual_tex) if visual_tex is not None else None
         ok, reason = validate_visual_obj_loadable(obj_dir)
         if not ok:
             raise RuntimeError(f"visual validation failed: {reason}")
     except Exception as e:
-        rec["error"] = f"visual mesh failed: {e}"
-        print(f"    ERROR: {rec['error']}")
+        rec["error"] = f"{object_id}: visual mesh failed: {e}"
+        print(f"    ERROR [{object_id}]: {rec['error']}")
         return rec
     finally:
         tmp_raw_aligned_obj.unlink(missing_ok=True)
@@ -1219,7 +1015,7 @@ def process_object(
             print("  exporting convex pieces...")
             for old_piece in meshes_dir.glob("coacd_convex_piece_*.obj"):
                 old_piece.unlink(missing_ok=True)
-            convex_pieces = list(trimesh.load(str(dst_coacd_obj), process=False).split())
+            convex_pieces = list(trimesh.load(str(dst_coacd_obj)).split())
             exported_piece_count = 0
             skipped_piece_count = 0
             for raw_idx, piece in enumerate(convex_pieces):
@@ -1249,8 +1045,8 @@ def process_object(
         wrls = obj_dir / "coacd.wrl"
         wrls.unlink(missing_ok=True)
     except Exception as e:
-        rec["error"] = f"convex export failed: {e}"
-        print(f"    ERROR: {rec['error']}")
+        rec["error"] = f"{object_id}: convex export failed: {e}"
+        print(f"    ERROR [{object_id}]: {rec['error']}")
         return rec
     finally:
         tmp_coacd_aligned_obj.unlink(missing_ok=True)
@@ -1272,8 +1068,8 @@ def process_object(
             if ret != 0 or (not dst_simplified_obj.exists()):
                 raise RuntimeError(f"ACVD failed (ret={ret}); simplified.obj missing")
     except Exception as e:
-        rec["error"] = f"ACVD failed: {e}"
-        print(f"    ERROR: {rec['error']}")
+        rec["error"] = f"{object_id}: ACVD failed: {e}"
+        print(f"    ERROR [{object_id}]: {rec['error']}")
         return rec
 
     rec["status"] = "success"
@@ -1380,13 +1176,9 @@ def process_dataset(dataset_root: Path, args: argparse.Namespace) -> None:
     if extra_dirs:
         print(f"Warning: {len(extra_dirs)} folders are not in manifest and will be ignored.")
 
-    if args.preview and args.workers > 1:
-        raise ValueError("--preview requires --workers 1")
-
     per_object: dict[str, dict] = {}
     process_cfg = {
         "force": bool(args.force),
-        "preview": bool(args.preview),
         "verbose": bool(args.verbose),
         "coacd_quiet": bool(args.coacd_quiet),
         "acvd_quiet": bool(args.acvd_quiet),
@@ -1397,8 +1189,6 @@ def process_dataset(dataset_root: Path, args: argparse.Namespace) -> None:
         "visual_target_faces": int(args.visual_target_faces),
         "visual_obj_decimals": int(args.visual_obj_decimals),
         "visual_texture_max_size": int(args.visual_texture_max_size),
-        "visual_texture_format": str(args.visual_texture_format),
-        "visual_jpeg_quality": int(args.visual_jpeg_quality),
         "coacd_piece_min_volume": float(args.coacd_piece_min_volume),
         "coacd_piece_min_extent": float(args.coacd_piece_min_extent),
     }
@@ -1537,11 +1327,6 @@ def parse_args():
         default=default_workers,
         help=f"Parallel workers (default: {default_workers}).",
     )
-    p.add_argument(
-        "--preview",
-        action="store_true",
-        help="Show trimesh preview after manifold principal-frame transform (requires GUI)",
-    )
     p.add_argument("--verbose", action="store_true", help="Verbose output")
     p.add_argument(
         "--coacd-quiet",
@@ -1560,14 +1345,14 @@ def parse_args():
     p.add_argument(
         "--coacd-timeout-sec",
         type=float,
-        default=100.0,
-        help="Timeout for CoACD per object in seconds (default: 1800). Set <=0 to disable.",
+        default=180.0,
+        help="Timeout for CoACD per object in seconds (default: 180). Set <=0 to disable.",
     )
     p.add_argument(
         "--acvd-timeout-sec",
         type=float,
-        default=100.0,
-        help="Timeout for ACVD per object in seconds (default: 1800). Set <=0 to disable.",
+        default=180.0,
+        help="Timeout for ACVD per object in seconds (default: 180). Set <=0 to disable.",
     )
     p.add_argument(
         "--acvd-vertnum", type=int, default=2000, help="ACVD: target vertex number"
@@ -1592,19 +1377,6 @@ def parse_args():
         type=int,
         default=1024,
         help="Max texture width/height for visual texture compression.",
-    )
-    p.add_argument(
-        "--visual-texture-format",
-        type=str,
-        choices=["png"],
-        default="png",
-        help="Visual texture format (PNG only).",
-    )
-    p.add_argument(
-        "--visual-jpeg-quality",
-        type=int,
-        default=85,
-        help="JPEG quality for visual texture (when format=jpg and no alpha).",
     )
     p.add_argument(
         "--coacd-piece-min-volume",

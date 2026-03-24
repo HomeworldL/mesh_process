@@ -7,15 +7,12 @@ import shutil
 from pathlib import Path
 
 from .base import (
-    CANONICAL_MTL_NAME,
     CANONICAL_RAW_OBJ_NAME,
     DEFAULT_MASS_KG,
     BaseIngestAdapter,
     DownloadReport,
     IngestConfig,
     OrganizeReport,
-    canonicalize_texture_assets,
-    copy_file_with_progress,
     download_google_drive_file,
     download_url_file,
     extract_zip,
@@ -43,16 +40,14 @@ class DexNetAdapter(BaseIngestAdapter):
     source_url_env_name = "DEXNET_URL"
     source_dir_env_name = "DEXNET_SOURCE_DIR"
 
-    @staticmethod
-    def _choose_obj(obj_paths: list[Path]) -> Path:
+    def _choose_obj(self, obj_paths: list[Path]) -> Path:
         names = {p.name.lower(): p for p in obj_paths}
         for key in ["textured.obj", "model.obj", "mesh.obj"]:
             if key in names:
                 return names[key]
         return sorted(obj_paths)[0]
 
-    @staticmethod
-    def _iter_candidate_dirs(root: Path) -> list[Path]:
+    def _iter_candidate_dirs(self, root: Path) -> list[Path]:
         """
         Candidate object folders are directories that contain at least one OBJ and
         whose direct children do not contain another OBJ directory layer.
@@ -110,7 +105,7 @@ class DexNetAdapter(BaseIngestAdapter):
             src = Path(local_archive).expanduser().resolve()
             if not src.exists() or not src.is_file():
                 raise FileNotFoundError(f"{self.archive_env_name} invalid: {src}")
-            copy_file_with_progress(src, archive_path, desc=f"copy {self.source_name} archive")
+            self._copy_file_with_progress(src, archive_path, desc=f"copy {self.source_name} archive")
             report.downloaded_files.append(relative_to_repo(cfg.repo_root, archive_path))
 
         if not archive_path.exists() or cfg.force:
@@ -145,8 +140,7 @@ class DexNetAdapter(BaseIngestAdapter):
 
         return report
 
-    @staticmethod
-    def _resolve_source_root(source_download_dir: Path) -> Path:
+    def _resolve_source_root(self, source_download_dir: Path) -> Path:
         source_link = source_download_dir / "source"
         if source_link.exists():
             return source_link
@@ -157,6 +151,30 @@ class DexNetAdapter(BaseIngestAdapter):
         if len(top_dirs) == 1:
             return top_dirs[0]
         return extract_dir
+
+    def _copy_file_with_progress(self, src_path: Path, dst_path: Path, desc: str | None = None) -> None:
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+        total = src_path.stat().st_size
+        pbar = None
+        if tqdm is not None:
+            pbar = tqdm(
+                total=total,
+                unit="B",
+                unit_scale=True,
+                unit_divisor=1024,
+                desc=desc or f"copy {src_path.name}",
+                leave=True,
+            )
+        with open(src_path, "rb") as fsrc, open(dst_path, "wb") as fdst:
+            while True:
+                chunk = fsrc.read(1024 * 1024)
+                if not chunk:
+                    break
+                fdst.write(chunk)
+                if pbar is not None:
+                    pbar.update(len(chunk))
+        if pbar is not None:
+            pbar.close()
 
     def organize(self, cfg: IngestConfig) -> OrganizeReport:
         src_root = self._resolve_source_root(cfg.source_download_dir)
@@ -200,24 +218,37 @@ class DexNetAdapter(BaseIngestAdapter):
             if dst_obj.exists() and not cfg.force:
                 continue
 
-            shutil.copy2(chosen, dst_obj)
-            # Search texture/material from current folder, then one level below.
-            mtl_src = next((p for p in sorted(folder.glob("*.mtl")) if p.is_file()), None)
-            tex_src = next((p for p in sorted(folder.glob("*.png")) if p.is_file()), None)
-            if mtl_src is None:
-                mtl_src = next((p for p in sorted(folder.glob("*/*.mtl")) if p.is_file()), None)
-            if tex_src is None:
-                tex_src = next((p for p in sorted(folder.glob("*/*.png")) if p.is_file()), None)
-            canonicalize_texture_assets(
-                dst_dir=dst_dir,
-                raw_obj_path=dst_obj,
-                texture_src=tex_src,
-                mtl_src=mtl_src,
-                create_mtl_if_texture=False,
+            ok_load, load_reason, mesh = self.load_obj_mesh(
+                chosen,
+                remove_unreferenced_vertices=False,
             )
+            if not ok_load or mesh is None:
+                report.failed_items.append(
+                    f"{folder.name}: failed to load mesh for trimesh export ({load_reason})"
+                )
+                shutil.rmtree(dst_dir, ignore_errors=True)
+                continue
+
+            try:
+                export_texture = self.mesh_has_texture(mesh)
+                if not export_texture:
+                    mesh = mesh.copy()
+                    mesh.remove_unreferenced_vertices()
+                self.export_trimesh_obj_assets(
+                    mesh,
+                    dst_dir,
+                    export_texture=export_texture,
+                    obj_name=CANONICAL_RAW_OBJ_NAME,
+                )
+            except Exception as e:
+                report.failed_items.append(f"{folder.name}: failed to export mesh assets ({e})")
+                shutil.rmtree(dst_dir, ignore_errors=True)
+                continue
             report.organized_objects += 1
 
-        report.notes.append(f"organized from {relative_to_repo(cfg.repo_root, src_root)}")
+        report.notes.append(
+            f"organized from {relative_to_repo(cfg.repo_root, src_root)} via trimesh stage-1 export"
+        )
         self.write_manifest_for_organize(cfg, report)
         return report
 

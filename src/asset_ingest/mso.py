@@ -13,7 +13,6 @@ from .base import (
     DownloadReport,
     IngestConfig,
     OrganizeReport,
-    canonicalize_texture_assets,
     relative_to_repo,
     sanitize_object_id,
 )
@@ -28,8 +27,7 @@ class MSOAdapter(BaseIngestAdapter):
     repo_url = "https://github.com/kevinzakka/mujoco_scanned_objects.git"
     repo_dirname = "mujoco_scanned_objects"
 
-    @staticmethod
-    def _run_git(args: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess:
+    def _run_git(self, args: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess:
         cmd = ["git", *args]
         where = str(cwd) if cwd is not None else os.getcwd()
         print(f"[MSO] ({where}) $ {' '.join(cmd)}", flush=True)
@@ -140,23 +138,33 @@ class MSOAdapter(BaseIngestAdapter):
             if dst_obj.exists() and not cfg.force:
                 continue
 
-            # Keep only normalized mesh path + canonical texture bundle.
-            shutil.copy2(src_obj, dst_obj)
-            src_tex = folder / "texture.png"
-            canonicalize_texture_assets(
-                dst_dir=dst_dir,
-                raw_obj_path=dst_obj,
-                texture_src=(src_tex if src_tex.is_file() else None),
-                mtl_src=None,
-                create_mtl_if_texture=True,
-                default_material_name="material_0",
+            ok_load, load_reason, mesh = self.load_obj_mesh(
+                src_obj,
+                remove_unreferenced_vertices=False,
             )
+            if not ok_load or mesh is None:
+                report.failed_items.append(f"load failed for {object_id}: {load_reason}")
+                shutil.rmtree(dst_dir, ignore_errors=True)
+                continue
+            try:
+                export_texture = self.mesh_has_texture(mesh)
+                if not export_texture:
+                    mesh = mesh.copy()
+                    mesh.remove_unreferenced_vertices()
+                self.export_trimesh_obj_assets(
+                    mesh,
+                    dst_dir,
+                    export_texture=export_texture,
+                )
+            except Exception as exc:
+                report.failed_items.append(f"export failed for {object_id}: {exc}")
+                shutil.rmtree(dst_dir, ignore_errors=True)
+                continue
 
             report.organized_objects += 1
 
         report.notes.append(
-            "organized from mujoco_scanned_objects/models; normalized to raw.obj + "
-            "texture_map.png + textured.mtl (when texture exists)"
+            "organized from mujoco_scanned_objects/models via trimesh stage-1 export"
         )
         self.write_manifest_for_organize(cfg, report)
         return report
