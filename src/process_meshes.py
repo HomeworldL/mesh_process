@@ -771,19 +771,21 @@ def validate_visual_obj_loadable(obj_dir: Path) -> tuple[bool, str | None]:
     return True, None
 
 
-def detect_visual_needs_flip(
+def decide_visual_flip(
     manifold_obj: Path,
-    visual_obj: Path,
+    candidate_obj: Path,
     *,
+    normal_agreement_threshold: float = 0.7,
     max_face_samples: int = 2048,
 ) -> tuple[bool, str]:
     """
-    Compare visual face normals against nearest manifold face normals.
-    Returns (needs_flip, debug_reason).
+    Decide whether the visual/raw orientation should be flipped.
+    - If candidate mesh is watertight, use its signed volume directly.
+    - Otherwise compare candidate face normals against nearest manifold face normals.
     """
     try:
         manifold_mesh = trimesh.load(str(manifold_obj))
-        visual_mesh = trimesh.load(str(visual_obj))
+        candidate_mesh = trimesh.load(str(candidate_obj))
     except Exception as e:
         return False, f"load failed: {e}"
 
@@ -791,45 +793,70 @@ def detect_visual_needs_flip(
         if not getattr(manifold_mesh, "geometry", None):
             return False, "manifold loaded as empty scene"
         manifold_mesh = trimesh.util.concatenate(tuple(manifold_mesh.geometry.values()))
-    if isinstance(visual_mesh, trimesh.Scene):
-        if not getattr(visual_mesh, "geometry", None):
-            return False, "visual loaded as empty scene"
-        visual_mesh = trimesh.util.concatenate(tuple(visual_mesh.geometry.values()))
+    if isinstance(candidate_mesh, trimesh.Scene):
+        if not getattr(candidate_mesh, "geometry", None):
+            return False, "candidate loaded as empty scene"
+        candidate_mesh = trimesh.util.concatenate(tuple(candidate_mesh.geometry.values()))
 
-    if len(manifold_mesh.faces) == 0 or len(visual_mesh.faces) == 0:
+    if len(manifold_mesh.faces) == 0 or len(candidate_mesh.faces) == 0:
         return False, "empty face set"
 
     try:
-        visual_centers = np.asarray(visual_mesh.triangles_center, dtype=float)
-        visual_normals = np.asarray(visual_mesh.face_normals, dtype=float)
-        if len(visual_centers) > int(max_face_samples):
+        candidate_is_watertight = bool(candidate_mesh.is_watertight)
+    except Exception:
+        candidate_is_watertight = False
+
+    if candidate_is_watertight:
+        try:
+            candidate_vol = float(candidate_mesh.volume)
+        except Exception as e:
+            return False, f"watertight candidate volume read failed: {e}"
+        if np.isfinite(candidate_vol) and abs(candidate_vol) > 1e-18:
+            needs_flip = candidate_vol < 0.0
+            return (
+                needs_flip,
+                (
+                    f"candidate watertight volume={candidate_vol:.6g}, "
+                    f"visual_flip_applied={needs_flip}"
+                ),
+            )
+
+    try:
+        candidate_centers = np.asarray(candidate_mesh.triangles_center, dtype=float)
+        candidate_normals = np.asarray(candidate_mesh.face_normals, dtype=float)
+        if len(candidate_centers) > int(max_face_samples):
             sample_idx = np.linspace(
                 0,
-                len(visual_centers) - 1,
+                len(candidate_centers) - 1,
                 num=int(max_face_samples),
                 dtype=int,
             )
-            visual_centers = visual_centers[sample_idx]
-            visual_normals = visual_normals[sample_idx]
-        _, _, triangle_id = trimesh.proximity.closest_point(manifold_mesh, visual_centers)
+            candidate_centers = candidate_centers[sample_idx]
+            candidate_normals = candidate_normals[sample_idx]
+        _, _, triangle_id = trimesh.proximity.closest_point(manifold_mesh, candidate_centers)
         ref_normals = np.asarray(manifold_mesh.face_normals, dtype=float)[np.asarray(triangle_id, dtype=int)]
     except Exception as e:
         return False, f"closest-point comparison failed: {e}"
 
     valid = (
-        np.all(np.isfinite(visual_normals), axis=1)
+        np.all(np.isfinite(candidate_normals), axis=1)
         & np.all(np.isfinite(ref_normals), axis=1)
     )
     if not np.any(valid):
         return False, "no valid normal pairs"
 
-    dots = np.einsum("ij,ij->i", visual_normals[valid], ref_normals[valid])
+    dots = np.einsum("ij,ij->i", candidate_normals[valid], ref_normals[valid])
     negative_ratio = float((dots < 0.0).mean())
     positive_ratio = float((dots > 0.0).mean())
-    needs_flip = negative_ratio > 0.5 and negative_ratio > positive_ratio
+    needs_flip = (
+        negative_ratio > float(normal_agreement_threshold)
+        and negative_ratio > positive_ratio
+    )
     reason = (
-        f"normal agreement: compared={len(dots)}, sampled_from={len(visual_mesh.faces)}, "
-        f"positive_ratio={positive_ratio:.3f}, negative_ratio={negative_ratio:.3f}"
+        f"manifold normal agreement: compared={len(dots)}, sampled_from={len(candidate_mesh.faces)}, "
+        f"threshold={float(normal_agreement_threshold):.3f}, "
+        f"positive_ratio={positive_ratio:.3f}, negative_ratio={negative_ratio:.3f}, "
+        f"visual_flip_applied={needs_flip}"
     )
     return needs_flip, reason
 
@@ -848,9 +875,9 @@ def process_object(
     dst_coacd_obj = obj_dir / "coacd.obj"
     dst_simplified_obj = obj_dir / "simplified.obj"
     tmp_raw_aligned_obj = obj_dir / "raw.aligned.tmp.obj"
+    tmp_raw_visual_oriented_obj = obj_dir / "raw.visual_oriented.tmp.obj"
     tmp_manifold_aligned_obj = obj_dir / "manifold.aligned.tmp.obj"
     tmp_coacd_aligned_obj = obj_dir / "coacd.aligned.tmp.obj"
-    tmp_visual_flipped_obj = obj_dir / "visual.flipped.tmp.obj"
     meshes_dir = obj_dir / "meshes"
     ensure_dir(str(meshes_dir))
 
@@ -928,14 +955,15 @@ def process_object(
         world_to_aligned_principal_T = np.asarray(
             info["world_to_aligned_principal_T"], dtype=float
         )
-        flip_faces = bool(info["flip_faces"])
+        physics_flip_faces = bool(info["flip_faces"])
+        print(f"  manifold/coacd orientation_fix_applied={physics_flip_faces}")
         transform_obj_text(
             str(dst_manifold_obj),
             str(tmp_manifold_aligned_obj),
             world_to_aligned_principal_T,
             mtllib_map=None,
-            flip_faces=flip_faces,
-            flip_normals=flip_faces,
+            flip_faces=physics_flip_faces,
+            flip_normals=physics_flip_faces,
         )
         os.replace(str(tmp_manifold_aligned_obj), str(dst_manifold_obj))
         ok, reason = validate_manifold_mesh(dst_manifold_obj)
@@ -952,6 +980,7 @@ def process_object(
     try:
         if _visual_outputs_exist(obj_dir) and not bool(process_cfg["force"]):
             print("  visual outputs exist -> skip")
+            print("  visual orientation_fix_applied=skipped_existing_outputs")
         else:
             print("  transforming raw.obj and running mesh_visual...")
             transform_obj_text(
@@ -959,9 +988,25 @@ def process_object(
                 str(tmp_raw_aligned_obj),
                 world_to_aligned_principal_T,
                 mtllib_map=None,
-                flip_faces=flip_faces,
-                flip_normals=flip_faces,
+                flip_faces=False,
+                flip_normals=False,
             )
+            visual_flip_faces, visual_flip_reason = decide_visual_flip(
+                dst_manifold_obj,
+                tmp_raw_aligned_obj,
+                normal_agreement_threshold=0.7,
+            )
+            print(f"  visual orientation decision: {visual_flip_reason}")
+            if visual_flip_faces:
+                transform_obj_text(
+                    str(tmp_raw_aligned_obj),
+                    str(tmp_raw_visual_oriented_obj),
+                    np.eye(4, dtype=float),
+                    mtllib_map=None,
+                    flip_faces=True,
+                    flip_normals=True,
+                )
+                os.replace(str(tmp_raw_visual_oriented_obj), str(tmp_raw_aligned_obj))
             mesh_visual(
                 obj_dir=str(obj_dir),
                 args=argparse.Namespace(**process_cfg),
@@ -970,19 +1015,6 @@ def process_object(
         visual_obj = obj_dir / "visual.obj"
         visual_mtl = resolve_visual_mtl_output(obj_dir)
         visual_tex = resolve_visual_texture_output(obj_dir)
-        needs_visual_flip, flip_reason = detect_visual_needs_flip(dst_manifold_obj, visual_obj)
-        print(f"  visual orientation check: {flip_reason}")
-        if needs_visual_flip:
-            print("  flipping visual.obj orientation to match manifold...")
-            transform_obj_text(
-                str(visual_obj),
-                str(tmp_visual_flipped_obj),
-                np.eye(4, dtype=float),
-                mtllib_map=None,
-                flip_faces=True,
-                flip_normals=True,
-            )
-            os.replace(str(tmp_visual_flipped_obj), str(visual_obj))
         rec["visual_obj_path"] = str(visual_obj) if visual_obj.exists() else None
         rec["visual_mtl_path"] = (
             str(visual_mtl)
@@ -999,7 +1031,7 @@ def process_object(
         return rec
     finally:
         tmp_raw_aligned_obj.unlink(missing_ok=True)
-        tmp_visual_flipped_obj.unlink(missing_ok=True)
+        tmp_raw_visual_oriented_obj.unlink(missing_ok=True)
 
     # Step 4: transform coacd.obj to aligned principal frame and export pieces
     try:
@@ -1011,8 +1043,8 @@ def process_object(
                 str(tmp_coacd_aligned_obj),
                 world_to_aligned_principal_T,
                 mtllib_map=None,
-                flip_faces=flip_faces,
-                flip_normals=flip_faces,
+                flip_faces=physics_flip_faces,
+                flip_normals=physics_flip_faces,
             )
             os.replace(str(tmp_coacd_aligned_obj), str(dst_coacd_obj))
         if need_convex_export:
