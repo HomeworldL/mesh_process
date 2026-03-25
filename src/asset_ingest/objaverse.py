@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+import math
 import os
 import random
 import shutil
@@ -27,10 +28,60 @@ class ObjaverseAdapter(BaseIngestAdapter):
     source_name = "Objaverse"
     version = "v1"
     fixed_subset_label = "Daily-Used"
+    normalized_default_mass_kg = 50.0
     category_anno_url = (
         "https://virutalbuy-public.oss-cn-hangzhou.aliyuncs.com/share/aigc3d/"
         "category_annotation.json"
     )
+
+    def _normalize_loaded_mesh(
+        self,
+        mesh: trimesh.Trimesh,
+        *,
+        target_max_extent: float = 1.0,
+        min_extent_eps: float = 1e-9,
+        max_aspect_ratio: float = 1e5,
+    ) -> tuple[bool, str, trimesh.Trimesh | None, dict[str, float]]:
+        metrics: dict[str, float] = {}
+        mesh = mesh.copy()
+
+        bounds = mesh.bounds
+        if bounds is None or len(bounds) != 2:
+            return False, "mesh has invalid bounds after cleanup", None, metrics
+
+        extent = bounds[1] - bounds[0]
+        if not all(math.isfinite(float(x)) for x in extent):
+            return False, "non-finite bounds extent", None, metrics
+
+        pre_max_extent = float(max(extent))
+        pre_min_extent = float(min(extent))
+        pre_aspect_ratio = float(pre_max_extent / max(pre_min_extent, min_extent_eps))
+        metrics["pre_max_extent"] = pre_max_extent
+        metrics["pre_min_extent"] = pre_min_extent
+        metrics["pre_aspect_ratio"] = pre_aspect_ratio
+        metrics["kept_vertex_count"] = float(len(mesh.vertices))
+
+        if pre_max_extent <= min_extent_eps:
+            return False, f"degenerate mesh extent: max_extent={pre_max_extent:.3e}", None, metrics
+        if pre_aspect_ratio > max_aspect_ratio:
+            return (
+                False,
+                (
+                    "extreme aspect ratio before normalization: "
+                    f"{pre_aspect_ratio:.3e} > {max_aspect_ratio:.3e}"
+                ),
+                None,
+                metrics,
+            )
+
+        center = mesh.bounding_box.centroid
+        scale = float(target_max_extent / pre_max_extent)
+        try:
+            mesh.apply_translation(-center)
+            mesh.apply_scale(scale)
+        except Exception as exc:
+            return False, f"failed to normalize mesh transform: {exc}", None, metrics
+        return True, "normalized", mesh, metrics
 
     def _ensure_category_annotation(self, cache_root: Path) -> Path | None:
         anno_dir = cache_root / "hf-objaverse-v1"
@@ -229,18 +280,37 @@ class ObjaverseAdapter(BaseIngestAdapter):
                     shutil.rmtree(out_dir, ignore_errors=True)
                     continue
                 export_texture = self.mesh_has_texture(mesh)
-                if not export_texture:
-                    mesh = mesh.copy()
-                    mesh.remove_unreferenced_vertices()
+                ok_norm, norm_reason, norm_mesh, norm_metrics = self._normalize_loaded_mesh(mesh)
+                if not ok_norm or norm_mesh is None:
+                    report.failed_items.append(
+                        f"{mesh_path.name}: normalize failed ({norm_reason}); metrics={norm_metrics}"
+                    )
+                    shutil.rmtree(out_dir, ignore_errors=True)
+                    continue
                 self.export_trimesh_obj_assets(
-                    mesh,
+                    norm_mesh,
                     out_dir,
                     export_texture=export_texture,
                 )
+                ok_post, post_reason = self.validate_normalized_obj_export(
+                    out_obj,
+                    target_max_extent=1.0,
+                    metrics=norm_metrics,
+                )
+                if not ok_post:
+                    report.failed_items.append(
+                        f"{mesh_path.name}: normalized export invalid ({post_reason}); metrics={norm_metrics}"
+                    )
+                    shutil.rmtree(out_dir, ignore_errors=True)
+                    continue
                 report.organized_objects += 1
             except Exception as exc:
                 report.failed_items.append(f"{mesh_path.name}: {exc}")
 
+        report.notes.append(
+            "Objaverse normalize policy: center=AABB center to origin, scale=max_extent to 1.0; "
+            "drop if pre_max_extent<=1e-9 or pre_aspect_ratio>1e5 or post_max_extent not in [0.95,1.05] or post_center_norm>5e-3"
+        )
         self.write_manifest_for_organize(cfg, report)
         return report
 
@@ -250,5 +320,5 @@ class ObjaverseAdapter(BaseIngestAdapter):
             homepage="https://objaverse.allenai.org/",
             download_method="objaverse_api",
             notes="Downloaded via objaverse.load_objects and mirrored under assets/objects/raw/Objaverse/objects",
-            default_mass_kg=DEFAULT_MASS_KG,
+            default_mass_kg=self.normalized_default_mass_kg,
         )

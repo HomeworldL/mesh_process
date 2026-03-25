@@ -30,8 +30,8 @@
     - pre `max_extent <= 1e-9` or pre aspect ratio (`max_extent/min_extent`) `> 1e5`
     - post `max_extent` not in `[0.95, 1.05]` or post center norm `> 5e-3`
 - Normalization + default mass policy:
-  - normalized datasets: `ShapeNetCore`, `ShapeNetSem`, `DGN`, `DDG` -> default `mass_kg=50.0`
-  - non-normalized datasets: `YCB`, `RealDex`, `GraspNet`, `HOPE`, `KIT`, `MSO`, `Objaverse`, `DexNet` -> default `mass_kg=0.1`
+  - normalized datasets: `ShapeNetCore`, `ShapeNetSem`, `DGN`, `DDG`, `Objaverse` -> default `mass_kg=50.0`
+  - non-normalized datasets: `YCB`, `RealDex`, `GraspNet`, `HOPE`, `KIT`, `MSO`, `DexNet` -> default `mass_kg=0.1`
 
 ## Build, Test, and Development Commands
 
@@ -101,7 +101,7 @@ Build `third_party/CoACD` and `third_party/ACVD` binaries before running `proces
 - Keep scripts CLI-driven with `argparse`; avoid hardcoded machine-specific paths.
 - Preserve dataset-agnostic path conventions under `assets/objects/{raw,processed}`.
 - Manifest mass policy:
-  - normalized datasets (`ShapeNetCore`, `ShapeNetSem`, `DGN`, `DDG`): if source mass unknown, write `mass_kg=50.0`
+  - normalized datasets (`ShapeNetCore`, `ShapeNetSem`, `DGN`, `DDG`, `Objaverse`): if source mass unknown, write `mass_kg=50.0`
   - other datasets: if source mass unknown, write `mass_kg=0.1`
 - Manifest texture policy: `has_texture` is determined only by whether `.png` texture files exist in the organized object folder.
 - Organized asset naming:
@@ -119,11 +119,24 @@ Build `third_party/CoACD` and `third_party/ACVD` binaries before running `proces
 - Implement all 3 methods: `download`, `organize`, `build_manifest`.
 - `organize` must call `self.write_manifest_for_organize(cfg, report)` at end.
 - Prefer trimesh-based export during organize for adapters that standardize OBJ assets.
+- Except `DDG`, current organize outputs are unified through trimesh-exported canonical stage-1 assets: `raw.obj` plus optional `textured.png` and `textured.mtl`.
 - Do not use the old `canonicalize_texture_assets(...)` path for new stage-1 organize logic.
 - `manifest` path fields must use repo-relative paths via `relative_to_repo(...)`.
 - `has_texture` must follow `.png`-only policy.
 - If source mass is unavailable, follow dataset policy above (`50.0` for normalized datasets; otherwise `0.1`).
 - Prefer `tqdm` for long loops (download and organize).
+
+## Current Organize Differences
+
+- `YCB`: prefer `google_16k`; only `google_16k` exports texture sidecars, fallback branches remain geometry-only.
+- `RealDex`: always OBJ-only; no texture assets.
+- `GraspNet`: require `textured.obj`; export texture only if both trimesh detects texture and `texture_map.png` exists.
+- `HOPE`: source meshes are scaled from centimeters to meters; export texture only if both trimesh detects texture and `texture_map.png` exists.
+- `KIT`: source meshes are scaled from millimeters to meters; source preference is `25k_tex > 5k_tex > Orig_tex > 800_tex > 25k > 5k > Orig > 800`; export texture only if both trimesh detects texture and same-stem PNG exists.
+- `MSO`: may synthesize a missing referenced MTL from `texture.png` before loading; export texture only if both trimesh detects texture and `texture.png` exists.
+- `Objaverse`: source `glb/gltf` meshes are normalized like DGN (AABB center to origin, max extent to `1.0`); texture export follows trimesh texture detection.
+- `DGN`: normalized OBJ-only export (AABB center to origin, max extent to `1.0`).
+- `DDG`: does not re-export meshes in organize; instead copies processed `ddg*` folders from `processed/DGN` and rebuilds manifests.
 
 ## Common Issues & References
 

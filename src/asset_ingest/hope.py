@@ -329,7 +329,7 @@ class HOPEAdapter(BaseIngestAdapter):
                 shutil.rmtree(dst_dir, ignore_errors=True)
                 continue
             try:
-                export_texture = self.mesh_has_texture(mesh)
+                export_texture = self.mesh_has_texture(mesh) and (mesh_dir / "texture_map.png").is_file()
                 if not export_texture:
                     mesh = mesh.copy()
                     mesh.remove_unreferenced_vertices()

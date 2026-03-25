@@ -151,6 +151,23 @@ class BaseIngestAdapter(ABC):
             return "unknown"
         return "mixed"
 
+    def append_texture_stats_for_manifest(
+        self,
+        manifest: IngestManifest,
+        report: OrganizeReport,
+    ) -> None:
+        """
+        EN: Append textured/untextured object counts from the final manifest.
+        ZH: 基于最终 manifest 追加有纹理/无纹理对象统计。
+
+        Used by / 用于: `write_manifest_for_organize`.
+        """
+        textured_count = sum(1 for obj in manifest.objects if obj.has_texture == "true")
+        untextured_count = sum(1 for obj in manifest.objects if obj.has_texture == "false")
+        report.notes.append(
+            f"texture stats: textured={textured_count}, untextured={untextured_count}"
+        )
+
     def _default_mtl_path(self, obj_dir: Path) -> Path | None:
         """
         EN: Prefer canonical `textured.mtl`, otherwise fall back to the first local `.mtl`.
@@ -296,16 +313,22 @@ class BaseIngestAdapter(ABC):
             return False, f"failed to load obj: {e}", None
 
         if isinstance(mesh, trimesh.Scene):
-            geoms = list(getattr(mesh, "geometry", {}).values())
-            if not geoms:
-                return False, "loaded object is an empty trimesh scene", None
-            if len(geoms) == 1:
-                mesh = geoms[0]
-            else:
-                try:
-                    mesh = trimesh.util.concatenate(geoms)
-                except Exception as e:
-                    return False, f"failed to merge scene geometry: {e}", None
+            try:
+                mesh = mesh.to_geometry()
+            except Exception as e:
+                return False, f"failed to bake scene geometry: {e}", None
+
+            if isinstance(mesh, trimesh.Scene):
+                geoms = list(getattr(mesh, "geometry", {}).values())
+                if not geoms:
+                    return False, "loaded object is an empty trimesh scene", None
+                if len(geoms) == 1:
+                    mesh = geoms[0]
+                else:
+                    try:
+                        mesh = trimesh.util.concatenate(geoms)
+                    except Exception as e:
+                        return False, f"failed to merge baked scene geometry: {e}", None
 
         if not isinstance(mesh, trimesh.Trimesh):
             return False, "loaded object is not a trimesh mesh", None
@@ -655,8 +678,7 @@ class BaseIngestAdapter(ABC):
         EN: Append dataset-level bbox min/max summaries after organize.
         ZH: 在 organize 结束后追加数据集级别的 bbox 极值统计。
 
-        Used by / 用于: all adapters that call `write_manifest_for_organize`;
-        also manually called by DGNAdapter for derived DDG.
+        Used by / 用于: all adapters that call `write_manifest_for_organize`.
         """
         target_dir = dataset_dir if dataset_dir is not None else cfg.source_processed_dir
         label = dataset_name or target_dir.name or cfg.source_name
@@ -744,6 +766,7 @@ class BaseIngestAdapter(ABC):
         else:
             report.notes.append("manifest validation passed")
         self.append_bbox_stats_for_dataset(cfg, report)
+        self.append_texture_stats_for_manifest(manifest, report)
 
 def sanitize_object_id(name: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", name.strip())

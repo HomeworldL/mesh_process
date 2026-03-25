@@ -97,8 +97,8 @@ python src/ingest_assets.py organize --source KIT
 python src/ingest_assets.py download --source DexNet
 python src/ingest_assets.py organize --source DexNet
 
-# Objaverse (use --subset to filter categories from category_annotation.json)
-python src/ingest_assets.py download --source Objaverse --subset Daily-Used
+# Objaverse (download defaults to the fixed Daily-Used subset)
+python src/ingest_assets.py download --source Objaverse
 python src/ingest_assets.py organize --source Objaverse
 # For evaluation subsets: deterministic random sample of N objects
 python src/ingest_assets.py organize --source Objaverse --sample-n 500
@@ -117,10 +117,12 @@ Notes:
 - Google Drive downloads use `gdown` (`pip install gdown`).
 - Download stage uses `tqdm` progress bars (YCB stream download, archive extract, Objaverse batch mirror).
 - `organize` will build `assets/objects/processed/<dataset>/manifest.json` automatically.
+- Except `DDG`, stage-1 `organize` exports canonical assets through `trimesh`: `raw.obj`, plus optional `textured.png` and `textured.mtl`.
+- `organize` reports now include `texture stats: textured=..., untextured=...`, computed from the final `manifest.json`.
 - `mass_kg` is included per object; when unknown, default mass depends on dataset normalization policy:
-  - normalized object datasets (`ShapeNetCore`, `ShapeNetSem`, `DGN`, `DDG`): `50.0 kg`
-  - non-normalized datasets (`YCB`, `RealDex`, `GraspNet`, `HOPE`, `KIT`, `MSO`, `Objaverse`, `DexNet`): `0.1 kg`
-- Canonical organized file names are: `raw.obj`, optional `texture_map.png`, optional `textured.mtl`.
+  - normalized object datasets (`ShapeNetCore`, `ShapeNetSem`, `DGN`, `DDG`, `Objaverse`): `50.0 kg`
+  - non-normalized datasets (`YCB`, `RealDex`, `GraspNet`, `HOPE`, `KIT`, `MSO`, `DexNet`): `0.1 kg`
+- Canonical organized file names are: `raw.obj`, optional `textured.png`, optional `textured.mtl`.
   - ShapeNetSem/ShapeNetCore default behavior is OBJ-only (`raw.obj` after normalization). Texture export is optional via env (`SHAPENET_EXPORT_TEXTURES=1` or source-specific switch).
 - ShapeNetCore / ShapeNetSem usually require terms acceptance and authenticated/manual archive retrieval.
 
@@ -130,7 +132,8 @@ Notes:
 
 - Download cache/extract: `assets/objects/raw/YCB/*`
 - Organized objects: `assets/objects/processed/YCB/YCB_<object_name>/raw.obj`
-- Keep `textured.mtl` and `texture_map.png` when present.
+- Source preference: `google_16k > poisson > any child containing textured.obj`.
+- Only `google_16k` is allowed to export texture sidecars; fallback branches stay geometry-only.
 
 ### RealDex
 
@@ -145,7 +148,8 @@ Notes:
 - Per object folder contains files such as `textured.obj`, `textured.mtl`, `texture_map.png`.
 - Organized output:
   - `assets/objects/processed/GraspNet/GraspNet_<id>/raw.obj`
-  - keep only `textured.mtl` and `texture_map.png` next to `raw.obj`.
+- Only `textured.obj` is accepted; if missing, the whole object is skipped.
+- Texture export requires both `trimesh` texture detection and source `texture_map.png`.
 
 ### Objaverse
 
@@ -153,13 +157,17 @@ Notes:
 - Organized objects: `assets/objects/processed/Objaverse/Objaverse_<name>/raw.obj`
 - Optional organize sampling: pass `--sample-n N` and optional `--sample-seed` (default `0`).
 - Raw mirror may use symlinks to cache files; this is expected.
+- Organize now normalizes geometry like DGN: AABB center -> origin, max extent -> `1.0`.
+- Texture export is decided by `trimesh` texture detection on the source `glb/gltf`.
+- Default fallback mass is `50.0 kg`.
 
 ### HOPE
 
 - Downloaded source (official folder mirror): `assets/objects/raw/HOPE/hope_objects/`
 - Official layout per object: `<object_name>/google_16k/{textured.obj,textured.mtl,texture_map.png}`
 - Organized objects: `assets/objects/processed/HOPE/HOPE_<object_name>/raw.obj`
-- If textures exist, normalized outputs are `textured.mtl` + `texture_map.png`.
+- Organize rescales source meshes from centimeters to meters (`0.01`).
+- Texture export requires both `trimesh` texture detection and source `texture_map.png`.
 
 ### KIT
 
@@ -168,7 +176,16 @@ Notes:
   - `assets/objects/raw/KIT/archives/<id>_<object>.zip`
   - `assets/objects/raw/KIT/objects/<object_name>/...`
 - Organized objects: `assets/objects/processed/KIT/KIT_<object_name>/raw.obj`
-- If textures exist, normalized outputs are `textured.mtl` + `texture_map.png`.
+- Source preference: `25k_tex > 5k_tex > Orig_tex > 800_tex > 25k > 5k > Orig > 800`.
+- Organize rescales source meshes from millimeters to meters (`0.001`).
+- Texture export requires both `trimesh` texture detection and a same-stem source PNG.
+
+### MSO
+
+- Raw source: sparse checkout of `mujoco_scanned_objects/models`.
+- Organized objects: `assets/objects/processed/MSO/MSO_<object_name>/raw.obj`
+- If OBJ references a missing MTL but source `texture.png` exists, organize synthesizes a minimal MTL before loading.
+- Texture export requires both `trimesh` texture detection and source `texture.png`.
 
 ### DexNet
 
@@ -177,7 +194,7 @@ Notes:
 - Optional override priority remains:
   `DEXNET_SOURCE_DIR` > `DEXNET_ARCHIVE` > `DEXNET_URL` > default Google Drive source.
 - Organized objects: `assets/objects/processed/DexNet/DexNet_<object_name>/raw.obj`
-- If textures exist, normalized outputs are `textured.mtl` + `texture_map.png`.
+- If textures are exported, canonical outputs are `textured.mtl` + `textured.png`.
 - Adapter is integrated in the same Stage-1 flow as other completed datasets.
 
 ### DGN / DDG
@@ -185,7 +202,9 @@ Notes:
 - Source archive is organized by `DGNAdapter`; output includes:
   - full set: `assets/objects/processed/DGN/`
   - derived subset (`ddg*` prefix): `assets/objects/processed/DDG/`
-- These two datasets are treated as normalized object models for default mass policy (`50.0 kg` when source mass is unknown).
+- `DGN` normalizes OBJ geometry: AABB center -> origin, max extent -> `1.0`, then exports OBJ-only via `trimesh`.
+- `DDG` is the only organize path that does not re-export with `trimesh`; it copies processed `ddg*` object folders from `processed/DGN` and rebuilds manifests.
+- These datasets are treated as normalized object models for default mass policy (`50.0 kg` when source mass is unknown).
 
 ### ShapeNetCore / ShapeNetSem
 
@@ -196,11 +215,11 @@ Notes:
 - ShapeNetCore details:
   - `download`: selective extraction from `ShapeNetCore.v2.zip` using `filter_lists.py` (allowed synsets + denylist ids), only keeps `model_normalized.{obj,mtl,json}` and referenced `images/*`.
   - `organize`: load each OBJ then normalize geometry (AABB center -> origin, max extent -> `1.0`), drop abnormal meshes.
-  - texture export is optional (default off): set `SHAPENET_CORE_EXPORT_TEXTURES=1` or `SHAPENET_EXPORT_TEXTURES=1`; exported textures are canonicalized to single `texture_map.png` + `textured.mtl`.
+  - texture export is optional (default off): set `SHAPENET_CORE_EXPORT_TEXTURES=1` or `SHAPENET_EXPORT_TEXTURES=1`; exported textures are canonicalized to single `textured.png` + `textured.mtl`.
 - ShapeNetSem details:
   - `download`: metadata + filtered `models-OBJ` (obj/mtl) + full `models-textures`.
   - `organize`: load each OBJ then normalize geometry (AABB center -> origin, max extent -> `1.0`), drop abnormal meshes.
-  - texture export is optional (default off): set `SHAPENET_SEM_EXPORT_TEXTURES=1` or `SHAPENET_EXPORT_TEXTURES=1`; exported textures are canonicalized to single `texture_map.png` + `textured.mtl`.
+  - texture export is optional (default off): set `SHAPENET_SEM_EXPORT_TEXTURES=1` or `SHAPENET_EXPORT_TEXTURES=1`; exported textures are canonicalized to single `textured.png` + `textured.mtl`.
   - abnormal-mesh rejection thresholds:
     - pre-normalization `max_extent <= 1e-9`, or pre-normalization aspect ratio (`max_extent / min_extent`) `> 1e5`
     - post-normalization `max_extent` not in `[0.95, 1.05]`
@@ -224,8 +243,8 @@ Flow per object:
   - inertia computation now directly uses trimesh built-ins: `moment_inertia`, `moment_inertia_frame`, `principal_inertia_components`, `principal_inertia_transform`.
   - principal-axis assignment selects signed/permuted axes that remain close to original XYZ orientation while still aligning to principal directions.
   - transformed manifold overwrites `manifold.obj` in the principal frame.
-- raw mesh is transformed by the same principal-frame transform and directly compressed to visual assets (`visual.obj`, optional `visual.mtl`, optional `visual_texture_map.png`); `inertia.obj` is no longer generated.
-  - Textured objects are treated as canonical single-texture input (`textured.mtl + texture_map.png`) and produce one `visual_texture_map.png`.
+- raw mesh is transformed by the same principal-frame transform and directly compressed to visual assets (`visual.obj`, optional `textured_visual.mtl`, optional `textured_visual.png`); `inertia.obj` is no longer generated.
+  - Textured objects are treated as canonical single-texture input (`textured.mtl + textured.png`) and produce one `textured_visual.png`.
   - before marking an object as success, Stage-2 validates that `visual.obj` is loadable as a non-empty scene with valid bounds.
 - `coacd.obj` is transformed by the same principal-frame transform, then convex export writes `meshes/coacd_convex_piece_*.obj`.
   - invalid CoACD parts are skipped during export if empty, if bbox max extent is below threshold, or if absolute volume is below threshold.

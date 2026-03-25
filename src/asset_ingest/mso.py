@@ -19,6 +19,11 @@ from .base import (
 from .filter_lists import MSO_BAD_INSTANCES
 from .manifest import IngestManifest
 
+try:
+    from tqdm import tqdm
+except Exception:  # pragma: no cover - tqdm optional
+    tqdm = None
+
 
 class MSOAdapter(BaseIngestAdapter):
     source_name = "MSO"
@@ -58,6 +63,61 @@ class MSOAdapter(BaseIngestAdapter):
         # Keep updates conservative to avoid local corruption; only fast-forward pull.
         cls._run_git(["sparse-checkout", "set", "models"], cwd=repo_dir)
         cls._run_git(["pull", "--ff-only", "--depth", "1", "--progress"], cwd=repo_dir)
+
+    def _read_first_mtllib(self, obj_path: Path) -> str | None:
+        try:
+            with obj_path.open("r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    stripped = line.strip()
+                    if not stripped.lower().startswith("mtllib "):
+                        continue
+                    parts = stripped.split(maxsplit=1)
+                    if len(parts) == 2 and parts[1].strip():
+                        return parts[1].strip()
+        except Exception:
+            return None
+        return None
+
+    def _read_first_usemtl(self, obj_path: Path) -> str | None:
+        try:
+            with obj_path.open("r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    stripped = line.strip()
+                    if not stripped.lower().startswith("usemtl "):
+                        continue
+                    parts = stripped.split(maxsplit=1)
+                    if len(parts) == 2 and parts[1].strip():
+                        return parts[1].strip()
+        except Exception:
+            return None
+        return None
+
+    def _ensure_missing_texture_mtl(self, src_obj: Path) -> Path | None:
+        mtl_name = self._read_first_mtllib(src_obj)
+        if not mtl_name:
+            return None
+
+        obj_dir = src_obj.parent
+        mtl_path = obj_dir / mtl_name
+        if mtl_path.exists():
+            return mtl_path
+
+        texture_path = obj_dir / "texture.png"
+        if not texture_path.is_file() or texture_path.stat().st_size <= 0:
+            return None
+
+        material_name = self._read_first_usemtl(src_obj) or Path(mtl_name).stem or "material_0"
+        mtl_text = (
+            f"newmtl {material_name}\n"
+            "Ka 1.000000 1.000000 1.000000\n"
+            "Kd 1.000000 1.000000 1.000000\n"
+            "Ks 0.000000 0.000000 0.000000\n"
+            "d 1.000000\n"
+            "illum 1\n"
+            "map_Kd texture.png\n"
+        )
+        mtl_path.write_text(mtl_text, encoding="utf-8")
+        return mtl_path
 
     def download(self, cfg: IngestConfig) -> DownloadReport:
         out_dir = cfg.source_download_dir
@@ -113,7 +173,9 @@ class MSOAdapter(BaseIngestAdapter):
             return report
 
         seen_ids: set[str] = set()
-        for folder in sorted(p for p in src_root.iterdir() if p.is_dir()):
+        folders = sorted(p for p in src_root.iterdir() if p.is_dir())
+        folder_iter = tqdm(folders, desc=f"{self.source_name} organize", unit="obj") if tqdm is not None else folders
+        for folder in folder_iter:
             if folder.name in MSO_BAD_INSTANCES:
                 continue
             src_obj = folder / "model.obj"
@@ -138,6 +200,7 @@ class MSOAdapter(BaseIngestAdapter):
             if dst_obj.exists() and not cfg.force:
                 continue
 
+            self._ensure_missing_texture_mtl(src_obj)
             ok_load, load_reason, mesh = self.load_obj_mesh(
                 src_obj,
                 remove_unreferenced_vertices=False,
@@ -147,7 +210,7 @@ class MSOAdapter(BaseIngestAdapter):
                 shutil.rmtree(dst_dir, ignore_errors=True)
                 continue
             try:
-                export_texture = self.mesh_has_texture(mesh)
+                export_texture = self.mesh_has_texture(mesh) and (src_obj.parent / "texture.png").is_file()
                 if not export_texture:
                     mesh = mesh.copy()
                     mesh.remove_unreferenced_vertices()

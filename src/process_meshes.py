@@ -281,6 +281,7 @@ def mesh_manifold_and_convex_decomp(
     input_path,
     manifold_output_path,
     coacd_output_path,
+    seed=0,
     quiet=False,
     timeout_sec=None,
 ):
@@ -294,6 +295,8 @@ def mesh_manifold_and_convex_decomp(
         str(manifold_output_path),
         "-pm",
         "on",
+        "--seed",
+        str(int(seed)),
     ]
     print("  [CoACD] running:", " ".join(cmd) if not quiet else "coacd (quiet mode)")
     run_kwargs = {}
@@ -886,6 +889,7 @@ def process_object(
                 str(src_obj),
                 str(dst_manifold_obj),
                 str(dst_coacd_obj),
+                seed=int(process_cfg["coacd_seed"]),
                 quiet=bool(process_cfg["coacd_quiet"]),
                 timeout_sec=coacd_timeout_sec,
             )
@@ -1182,6 +1186,7 @@ def process_dataset(dataset_root: Path, args: argparse.Namespace) -> None:
         "verbose": bool(args.verbose),
         "coacd_quiet": bool(args.coacd_quiet),
         "acvd_quiet": bool(args.acvd_quiet),
+        "coacd_seed": int(args.coacd_seed),
         "coacd_timeout_sec": (float(args.coacd_timeout_sec) if float(args.coacd_timeout_sec) > 0 else None),
         "acvd_timeout_sec": (float(args.acvd_timeout_sec) if float(args.acvd_timeout_sec) > 0 else None),
         "acvd_vertnum": int(args.acvd_vertnum),
@@ -1341,6 +1346,12 @@ def parse_args():
         action="store_true",
         default=True,
         help="Run ACVD quietly (default: enabled).",
+    )
+    p.add_argument(
+        "--coacd-seed",
+        type=int,
+        default=0,
+        help="Fixed random seed passed to CoACD for reproducible decomposition (default: 0).",
     )
     p.add_argument(
         "--coacd-timeout-sec",

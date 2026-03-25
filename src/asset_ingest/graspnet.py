@@ -18,6 +18,11 @@ from .base import (
 )
 from .manifest import IngestManifest
 
+try:
+    from tqdm import tqdm
+except Exception:  # pragma: no cover - tqdm optional
+    tqdm = None
+
 
 class GraspNetAdapter(BaseIngestAdapter):
     source_name = "GraspNet"
@@ -45,13 +50,6 @@ class GraspNetAdapter(BaseIngestAdapter):
 
         return report
 
-    def _choose_obj(self, obj_paths: list[Path]) -> Path:
-        names = {p.name.lower(): p for p in obj_paths}
-        for key in ["textured.obj", "nontextured.obj", "model.obj", "mesh.obj"]:
-            if key in names:
-                return names[key]
-        return sorted(obj_paths)[0]
-
     def _resolve_models_root(self, source_root: Path) -> Path:
         # Expected layout after extraction:
         # raw/GraspNet/models/models/<object_id>/
@@ -78,12 +76,14 @@ class GraspNetAdapter(BaseIngestAdapter):
             return report
 
         seen_ids: set[str] = set()
-        for folder in sorted(p for p in src_root.iterdir() if p.is_dir()):
-            objs = [x for x in folder.iterdir() if x.is_file() and x.suffix.lower() == ".obj"]
-            if not objs:
+        skipped_missing_textured = 0
+        folders = sorted(p for p in src_root.iterdir() if p.is_dir())
+        folder_iter = tqdm(folders, desc=f"{self.source_name} organize", unit="obj") if tqdm is not None else folders
+        for folder in folder_iter:
+            chosen = folder / "textured.obj"
+            if not chosen.is_file():
+                skipped_missing_textured += 1
                 continue
-
-            chosen = self._choose_obj(objs)
             base_name = sanitize_object_id(folder.name)
             base_id = sanitize_object_id(f"{self.source_name}_{base_name}")
             object_id = base_id
@@ -111,7 +111,7 @@ class GraspNetAdapter(BaseIngestAdapter):
                 shutil.rmtree(dst_dir, ignore_errors=True)
                 continue
             try:
-                export_texture = self.mesh_has_texture(mesh)
+                export_texture = self.mesh_has_texture(mesh) and (folder / "texture_map.png").is_file()
                 if not export_texture:
                     mesh = mesh.copy()
                     mesh.remove_unreferenced_vertices()
@@ -127,6 +127,9 @@ class GraspNetAdapter(BaseIngestAdapter):
             report.organized_objects += 1
 
         report.notes.append(f"organized from {src_root}")
+        report.notes.append(
+            f"skipped without textured.obj: {skipped_missing_textured}"
+        )
         self.write_manifest_for_organize(cfg, report)
         return report
 

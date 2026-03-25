@@ -18,6 +18,11 @@ from .base import (
 )
 from .manifest import IngestManifest
 
+try:
+    from tqdm import tqdm
+except Exception:  # pragma: no cover - tqdm optional
+    tqdm = None
+
 
 class RealDexAdapter(BaseIngestAdapter):
     source_name = "RealDex"
@@ -73,7 +78,8 @@ class RealDexAdapter(BaseIngestAdapter):
             return report
 
         seen_ids: set[str] = set()
-        for src_obj in obj_files:
+        obj_iter = tqdm(obj_files, desc=f"{self.source_name} organize", unit="obj") if tqdm is not None else obj_files
+        for src_obj in obj_iter:
             base_name = sanitize_object_id(src_obj.stem)
             base_id = sanitize_object_id(f"{self.source_name}_{base_name}")
             object_id = base_id

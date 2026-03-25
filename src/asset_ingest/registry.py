@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from .base import BaseIngestAdapter
+from .ddg import DDGAdapter
 from .dgn import DGNAdapter
 from .dexnet import DexNetAdapter
 from .graspnet import GraspNetAdapter
@@ -26,6 +27,7 @@ ADAPTERS: dict[str, type[BaseIngestAdapter]] = {
     "MSO": MSOAdapter,
     "Objaverse": ObjaverseAdapter,
     "DGN": DGNAdapter,
+    "DDG": DDGAdapter,
     "ShapeNetCore": ShapeNetCoreAdapter,
     "ShapeNetSem": ShapeNetSemAdapter,
 }

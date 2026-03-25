@@ -135,35 +135,25 @@ class KITAdapter(BaseIngestAdapter):
     def _choose_obj(self, obj_paths: list[Path]) -> Path:
         def score(path: Path) -> tuple[int, str]:
             n = path.name.lower()
-            if n.endswith("_orig_tex.obj"):
-                return (0, n)
             if n.endswith("_25k_tex.obj"):
-                return (1, n)
+                return (0, n)
             if n.endswith("_5k_tex.obj"):
+                return (1, n)
+            if n.endswith("_orig_tex.obj"):
                 return (2, n)
             if n.endswith("_800_tex.obj"):
                 return (3, n)
-            if n.endswith("_tex.obj"):
+            if n.endswith("_25k.obj"):
                 return (4, n)
-            if n.endswith("_orig.obj"):
+            if n.endswith("_5k.obj"):
                 return (5, n)
+            if n.endswith("_orig.obj"):
+                return (6, n)
+            if n.endswith("_800.obj"):
+                return (7, n)
             return (10, n)
 
         return sorted(obj_paths, key=score)[0]
-
-    def _pick_sidecar(self, folder: Path, chosen_obj: Path) -> tuple[Path | None, Path | None]:
-        # Prefer sidecars matching selected OBJ stem.
-        stem = chosen_obj.stem
-        mtl = folder / f"{stem}.mtl"
-        tex = folder / f"{stem}.png"
-        mtl_src = mtl if mtl.is_file() else None
-        tex_src = tex if tex.is_file() else None
-
-        if mtl_src is None:
-            mtl_src = next((p for p in sorted(folder.glob("*.mtl")) if p.is_file()), None)
-        if tex_src is None:
-            tex_src = next((p for p in sorted(folder.glob("*.png")) if p.is_file()), None)
-        return mtl_src, tex_src
 
     def organize(self, cfg: IngestConfig) -> OrganizeReport:
         src_root = cfg.source_download_dir / "objects"
@@ -176,8 +166,9 @@ class KITAdapter(BaseIngestAdapter):
             return report
 
         seen_ids: set[str] = set()
-
-        for folder in sorted(p for p in src_root.iterdir() if p.is_dir()):
+        folders = sorted(p for p in src_root.iterdir() if p.is_dir())
+        folder_iter = tqdm(folders, desc=f"{self.source_name} organize", unit="obj") if tqdm is not None else folders
+        for folder in folder_iter:
             objs = [x for x in folder.iterdir() if x.is_file() and x.suffix.lower() == ".obj"]
             if not objs:
                 continue
@@ -209,16 +200,12 @@ class KITAdapter(BaseIngestAdapter):
                 report.failed_items.append(f"load failed for {object_id}: {load_reason}")
                 shutil.rmtree(dst_dir, ignore_errors=True)
                 continue
-            mtl_src, tex_src = self._pick_sidecar(folder, chosen)
             try:
-                export_texture = (
-                    mtl_src is not None
-                    and tex_src is not None
-                    and self.mesh_has_texture(mesh)
-                )
+                mesh = mesh.copy()
+                export_texture = self.mesh_has_texture(mesh) and (folder / f"{chosen.stem}.png").is_file()
                 if not export_texture:
-                    mesh = mesh.copy()
                     mesh.remove_unreferenced_vertices()
+                mesh.apply_scale(0.001)
                 self.export_trimesh_obj_assets(
                     mesh,
                     dst_dir,
@@ -231,6 +218,8 @@ class KITAdapter(BaseIngestAdapter):
             report.organized_objects += 1
 
         report.notes.append(f"organized from {src_root}")
+        report.notes.append("KIT organize selection priority: 25k_tex > 5k_tex > Orig_tex > 800_tex > 25k > 5k > Orig > 800")
+        report.notes.append("KIT scale policy: source mm -> exported m via uniform scale 0.001")
         self.write_manifest_for_organize(cfg, report)
         return report
 
